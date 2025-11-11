@@ -6,3 +6,5 @@ scripts/
 *.yaml
 *.yml
 trigger.json
+*.env
+*.pyc

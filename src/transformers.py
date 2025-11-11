@@ -1,6 +1,5 @@
 import re
 import copy
-from src.base import BaseTransformer
 from typing import Any, Optional, Iterable, List, Set
 import xml.etree.ElementTree as ET
 import json
@@ -102,6 +101,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     _written_paths = set()
 
     records = {}
+    print(f"length of root records: {len(list(root.iter('record')))}")
     for i, record in enumerate (root.iter('record')):
         
     ######################## Find_CALM_Record_ID_Element ###########################################################
@@ -879,10 +879,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     print(f"{len(records)} records processed from the XML file.")
     return records
 
-class NewlineToPTransformer(BaseTransformer):
-    def __init__(self, fields: Optional[Iterable[str]] = None, match="\\n", replace="<p>"):
-        super().__init__(name="newline_to_p", config={"fields": fields, "match": match, "replace": replace})
-        self.fields = fields
+class NewlineToPTransformer():
+    def __init__(self, target_columns: Optional[Iterable[str]] = None, match="\\n", replace="<p>"):
+        self.target_columns = target_columns
         self.match = match
         self.replace = replace
         self.regex = re.compile(self.match)
@@ -988,20 +987,14 @@ class NewlineToPTransformer(BaseTransformer):
                 cur = cur[idx]
         return False
 
-    def transform_json(self, data: dict, fields: Optional[Iterable[str]] = None, json_id: Optional[int] = None, **kwargs) -> dict:
+    def transform_json(self, data: dict, target_columns: Optional[Iterable[str]] = None, json_id: Optional[int] = None, **kwargs) -> dict:
         """
-        If fields is None, apply newline -> <p> to every string value in the JSON (like YNaming).
-        If fields is provided, keep existing per-field behaviour.
+        If target_columns is None, apply newline -> <p> to every string value in the JSON (like YNaming).
+        If target_columns is provided, keep existing per-field behaviour.
         """
         payload = copy.deepcopy(data)
 
-        # try to import logging helper for diagnostics; optional
-        try:
-            from src.diagnostics_db import log_transformation
-        except Exception:
-            log_transformation = None
-
-        if fields is None:
+        if target_columns is None:
             # apply to all string fields and log transformations when json_id provided
             def _walk_and_transform_and_log(obj, parent_path=''):
                 if isinstance(obj, dict):
@@ -1035,7 +1028,8 @@ class NewlineToPTransformer(BaseTransformer):
                         except Exception:
                             orig_ranges = None
                             trans_ranges = None
-                        # log the transformation if requested
+                        #TODO:  use logger to log transformation
+                        """
                         if json_id is not None and log_transformation:
                             try:
                                 log_transformation(json_id, header=parent_path, desc=f"Replaced '{self.match}' with '{self.replace}'", match=True, orig_ranges=orig_ranges, trans_ranges=trans_ranges)
@@ -1044,6 +1038,7 @@ class NewlineToPTransformer(BaseTransformer):
                                     log_transformation(json_id, header=parent_path, desc=f"Replaced '{self.match}' with '{self.replace}'", match=True)
                                 except Exception:
                                     pass
+                        """
                     return new
                 return obj
 
@@ -1051,7 +1046,7 @@ class NewlineToPTransformer(BaseTransformer):
             return payload
 
         # ...existing per-field logic when `fields` is provided...
-        for field_path in fields:
+        for field_path in target_columns:
             # existing code expects to resolve dotted paths; keep your current implementation
             current = self.get_by_path(payload, field_path)  # placeholder for your path getter
             if not isinstance(current, str):
@@ -1081,16 +1076,11 @@ class NewlineToPTransformer(BaseTransformer):
         obj = copy.deepcopy(data)
 
         # If no explicit fields were configured, apply to all string fields
-        if not self.fields:
+        if not self.target_columns:
             # forward json_id so transform_json can log per-string transformations
-            return self.transform_json(obj, fields=None, json_id=json_id)
+            return self.transform_json(obj, target_columns=None, json_id=json_id)
 
-        try:
-            from src.diagnostics_db import log_transformation
-        except Exception:
-            log_transformation = None
-
-        for field in self.fields:
+        for field in self.target_columns:
             candidates = [field]
             if field.startswith('record.'):
                 candidates.append(field[len('record.'):])
@@ -1099,13 +1089,15 @@ class NewlineToPTransformer(BaseTransformer):
 
             for candidate in candidates:
                 changed, orig_ranges, trans_ranges = self._transform_field(obj, candidate)
+                #TODO: use logger to log transformation
+                """
                 if changed and json_id is not None and log_transformation:
                     try:
                         log_transformation(json_id, header=candidate, desc=f"Replaced '{self.match}' with '{self.replace}'", match=True, orig_ranges=orig_ranges, trans_ranges=trans_ranges)
                     except Exception:
                         log_transformation(json_id, header=candidate, desc=f"Replaced '{self.match}' with '{self.replace}'", match=True)
                     break
-
+                """
         return obj
 
     def _transform_field(self, obj, field_path):
@@ -1171,77 +1163,25 @@ class NewlineToPTransformer(BaseTransformer):
         return False, None, None
     
 
-class YNamingTransformer(BaseTransformer):
+class YNamingTransformer():
     """Transformer for applying Y naming conventions."""
     
     def __init__(self, 
                  target_columns: Optional[List[str]] = None,
                  backup_original: bool = True):
         """Initialize the transformer."""
-        super().__init__(name="y_naming", config={})
         self.logger = logging.getLogger("pipeline.transformers.y_naming")
         # Default columns to process
-        self.target_columns = target_columns or [
-            'Covering Dates',
-            'Former Reference(s)',
-            'Title',
-            'Description'
-        ]
-        # Loaded definitive reference set (optional)
-        self._refs = None
-
-    def fit(self, df, **kwargs):
-        """Dummy fit method for compatibility."""
-        self._fitted = True
-        return self
-
-    def transform(self, df, **kwargs):
-        """Dummy transform method for compatibility."""
-        return df
-        
+        self.target_columns = target_columns
         self.backup_original = backup_original
         # Loaded definitive reference set (optional)
         self._refs = None
-    
-    def load_reference_set_from_csv(self, csv_path: str, header_name: str = 'PA_ref') -> Set[str]:
-        """
-        Load definitive PA references from a CSV file. Validates csv_path and header presence.
-        Returns a set of reference strings.
-        """
-        p = Path(csv_path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"Path does not exist: {p}")
-        refs: Set[str] = set()
-        with p.open('r', encoding='utf-8') as fh:
-            reader = csv.DictReader(fh)
-            # Normalize headers to lowercase for lookup
-            # Normalize headers (strip BOM and whitespace) for lookup
-            headers = []
-            for h in reader.fieldnames or []:
-                if h is None:
-                    headers.append('')
-                else:
-                    headers.append(h.strip().lstrip('\ufeff').lower())
-            if header_name.lower() not in headers:
-                raise RuntimeError(f"Expected header '{header_name}' not found in CSV. Available headers: {reader.fieldnames}")
-            # find actual header key (original casing)
-            actual_header = None
-            for orig_h in reader.fieldnames:
-                if orig_h is None:
-                    continue
-                if orig_h.strip().lstrip('\ufeff').lower() == header_name.lower():
-                    actual_header = orig_h
-                    break
-            if actual_header is None:
-                raise RuntimeError("Cannot determine header name in CSV")
-            for row in reader:
-                val = row.get(actual_header)
-                if val:
-                    refs.add(val.strip())
-        self._refs = refs
-        self.logger.info(f"Loaded {len(refs)} references from {p}")
-        return refs
 
+    def transform(self, data, json_id=None, **kwargs):
+        # Delegate to transform_json; apply to all if target_columns is None
+        return self.transform_json(data, target_columns=self.target_columns, json_id=json_id)
+        
+        
     # regex to find embedded candidate tokens: requires at least one slash
     _embedded_token_re = re.compile(r'([A-Z0-9-]+(?:/[A-Z0-9-]+)+/?)')
 
@@ -1312,7 +1252,7 @@ class YNamingTransformer(BaseTransformer):
         return self._embedded_token_re.sub(repl, text)
 
     # ----- JSON-dict transform API for pipeline runtime -----
-    def transform_json(self, data: dict, fields: Optional[List[str]] = None, json_id: Optional[int] = None) -> dict:
+    def transform_json(self, data: dict, target_columns: Optional[List[str]] = None, json_id: Optional[int] = None) -> dict:
         """Apply Y-naming to a JSON dict for the given field paths and log changes.
 
         fields: list of dotted field paths like 'record.title' or 'record.relatedMaterial[0].description'
@@ -1326,12 +1266,12 @@ class YNamingTransformer(BaseTransformer):
 
         # Important: treat fields=None as the signal to apply to ALL string values.
         # If caller passes an explicit list (possibly empty), only those fields are processed.
-        if fields is None:
+        if target_columns is None:
             # Apply to all string values recursively
             self._transform_all_strings_json(obj, json_id, log_transformation)
         else:
             # Use the explicit fields list provided by the caller
-            for field in fields:
+            for field in target_columns:
                 candidates = [field]
                 if field.startswith('record.'):
                     candidates.append(field[len('record.'):])

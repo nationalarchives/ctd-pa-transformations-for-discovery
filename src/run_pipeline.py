@@ -8,6 +8,8 @@ from botocore.exceptions import ClientError
 repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
 
+from src.utils import find_key
+from src.utils import merge_xml_files
 from src.transformers import NewlineToPTransformer, YNamingTransformer, convert_to_json
 
 # S3 client used when running in AWS (or when credentials/profile available)
@@ -29,12 +31,14 @@ def _resolve_env_path(env_name: str, default_path: Path) -> Path:
 
 # Directories and files used by the handler. These can be overridden via env vars.
 input_dir = _resolve_env_path("CTD_DATA_INPUT", repo_root / "data" / "triggers")
+intermediate_dir = _resolve_env_path("CTD_DATA_INTERMEDIATE", repo_root / "data" / "intermediate")
 output_dir = _resolve_env_path("CTD_DATA_OUTPUT", repo_root / "data" / "processed")
 json_file_path = _resolve_env_path("CTD_TRIGGER_JSON", repo_root / "trigger.json")
 
 # Ensure directories exist if you write locally
 input_dir.mkdir(parents=True, exist_ok=True)
 output_dir.mkdir(parents=True, exist_ok=True)
+intermediate_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _load_json_file(path: Path) -> dict:
@@ -67,6 +71,7 @@ def lambda_handler(event, context):
     # 1. Get bucket and key from event
     action = event.get('action')
     key = event.get('file')
+    merge_xml = event.get('merge_xml')
     bucket = event.get('bucket')  # optional - may be omitted for local runs
 
     if not action or not key:
@@ -92,15 +97,27 @@ def lambda_handler(event, context):
             }
     else:
         # Use local file
-        xml_path_to_convert = input_dir / key
+        if merge_xml:
+            print(f"Merging XML files in {input_dir} into one for conversion...")
+            date = Path().stat().st_mtime
+            merged_output_path = input_dir / f"merged_input_{date}.xml"
+            merge_xml_files(
+                triggers_dir=input_dir,
+                output_path=merged_output_path
+            )
+            xml_path_to_convert = merged_output_path
+            print(f"Finished merging XML files into: {merged_output_path}")
+        else:
+            xml_path_to_convert = input_dir / key
         if not xml_path_to_convert.exists() or not xml_path_to_convert.is_file():
             return {
                 "statusCode": 404,
                 "body": f"Local XML file not found: {xml_path_to_convert}"
             }
-
+        
     # 3. Convert XML to JSON
     try:
+        print(f"Converting XML to JSON: {xml_path_to_convert}...")
         records = convert_to_json(xml_path=str(xml_path_to_convert), output_dir=str(output_dir))
         print(f"Files in output_dir after conversion:")
         for f in output_dir.iterdir():
@@ -117,58 +134,107 @@ def lambda_handler(event, context):
 
     # 4. Load the converted JSON (convert_xml_to_json should have written it)
     converted_xml_to_json_files = records
-    transformed_path = output_dir / f"{Path(key).stem}_transformed.json"
 
-    tasks = {
-        "newline_to_p": {
-            "params": {
-                "match": "\n",
-                "replace": "<p>",
-                },
-            "fields": None
+    # save the converted files to disk to investigation - remove this in the future
+    """
+    for filename, _file in converted_xml_to_json_files.items():
+        output_file = intermediate_dir / f"{filename}.json"
+        try:
+            with output_file.open("w", encoding="utf-8") as fh:
+                json.dump(_file, fh, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            print(f"Error writing transformed json to {output_file}: {exc}")
+    """
+
+    tmp_config = {
+        "tasks": {
+            "newline_to_p": {
+                "params": {
+                    "match": "\n",
+                    "replace": "<p>",
+                    },
+                "fields": None
+            },
+            "y_naming": {
+                "fields": None
+            }
         },
-        "y_naming": {
-            "fields": None
-        }
-    }   
+        "record_level_dirs": True
+    }
+
+    record_level_mapping = {
+        1: '1. FONDS',
+        2: '2. SUB-FONDS',
+        3: '3. SUB-SUB-FONDS',
+        4: '4. SUB-SUB-SUB-FONDS',
+        5: '5. SUB-SUB-SUB-SUB-FONDS',
+        6: '6. SERIES',
+        7: '7. SUB-SERIES',
+        8: '8. SUB-SUB-SERIES',
+        9: '9. FILE',
+        10: '10. ITEM'
+    }
+    
 
     # 5. Apply transformations if we have JSON data
-    if converted_xml_to_json_files:
-        for filename, _file in converted_xml_to_json_files.items():
-            task = tasks.get('newline_to_p')
-            n = NewlineToPTransformer(fields=None, **task.get('params', {}))
-            transformed_json = n.transform(_file)
-            y = YNamingTransformer(target_columns=None)
-            transformed_json = y.transform(transformed_json)
+    
+    import sys
+    import time
 
-            output_file = output_dir / f"{filename}.json"
+    total_count = len(converted_xml_to_json_files)
+    for i in range(total_count):
+        if converted_xml_to_json_files:
+            for filename, _file in converted_xml_to_json_files.items():
 
-            # Save the final transformed JSON locally
-            try:
-                with output_file.open("w", encoding="utf-8") as fh:
-                    json.dump(transformed_json, fh, ensure_ascii=False, indent=2)
-            except Exception as exc:
-                print(f"Error writing transformed json to {output_file}: {exc}")
+                # newline to <p> transformation
+                task = tmp_config['tasks'].get('newline_to_p')
+                n = NewlineToPTransformer(target_columns=None, **task.get('params', {}))
+                transformed_json = n.transform(_file)
 
-        # 6. Optionally upload to S3 if bucket was provided
-        if bucket and transformed_json:
-            output_key = f"{Path(key).stem}_transformed.json"
-            try:
-                s3.put_object(
-                    Bucket=bucket,
-                    Key=output_key,
-                    Body=json.dumps(transformed_json, ensure_ascii=False, indent=2)
-                )
-            except ClientError as e:
-                return {
-                    "statusCode": 500,
-                    "body": f"Error uploading to S3: {e.response['Error']['Code']}"
-                }
+                # Y naming transformation
+                task = tmp_config['tasks'].get('y_naming')
+                y = YNamingTransformer(target_columns=None)
+                transformed_json = y.transform(transformed_json)
 
-        return {
-            "statusCode": 200,
-            "body": f"Processed {key} successfully"
-        }
+                # Save the final transformed JSON locally
+                # save the transformed json into level based directories if needed
+                if tmp_config.get("record_level_dirs"):
+                    level = next((v for v in find_key(transformed_json, "catalogueLevel")), None)
+                    dir_name = record_level_mapping.get(level)
+                    target_dir = output_dir / dir_name
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    output_file = output_dir / dir_name / f"{filename}.json"
+                else:
+                    output_file = output_dir / f"{filename}.json"
+                try:
+                    with output_file.open("w", encoding="utf-8") as fh:
+                        json.dump(transformed_json, fh, ensure_ascii=False, indent=2)
+                except Exception as exc:
+                    print(f"Error writing transformed json to {output_file}: {exc}")
+
+            # 6. Optionally upload to S3 if bucket was provided
+            if bucket and transformed_json:
+                output_key = f"{Path(key).stem}_transformed.json"
+                try:
+                    s3.put_object(
+                        Bucket=bucket,
+                        Key=output_key,
+                        Body=json.dumps(transformed_json, ensure_ascii=False, indent=2)
+                    )
+                except ClientError as e:
+                    return {
+                        "statusCode": 500,
+                        "body": f"Error uploading to S3: {e.response['Error']['Code']}"
+                    }
+
+            return {
+                "statusCode": 200,
+                "body": f"Processed {key} successfully"
+            }
+        sys.stdout.write(f"\rProcessing {i}/{total_count}")
+        sys.stdout.flush()
+        time.sleep(0.05)
+
 
 if __name__ == "__main__":
     print("Running pipeline locally (not in Lambda)...")
