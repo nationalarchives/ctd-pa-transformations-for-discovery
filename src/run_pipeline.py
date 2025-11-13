@@ -79,14 +79,6 @@ if run_mode in ["local", "local_s3"]:
 transformations_str = os.environ.get("TRANS_CONFIG")
 transformation_config = _load_json_file(transformations_str, logger=logger)
 
-# S3 folder configuration (no trailing slashes)
-s3_ingestion_folder = os.getenv("S3_INGESTION_FOLDER", "xml_input")
-s3_egestion_folder = os.getenv("S3_EGESTION_FOLDER", "json_outputs")
-use_level_subfolders = os.getenv("S3_USE_LEVEL_SUBFOLDERS", "false").strip().lower() in ("1", "true", "yes", "y")
-
-logger.info("S3 folders - Ingestion: %s, Egestion: %s, Level subfolders: %s", 
-           s3_ingestion_folder, s3_egestion_folder, use_level_subfolders)
-
 def lambda_handler(event, context):
     
     # 1. Get bucket and key from event
@@ -99,21 +91,22 @@ def lambda_handler(event, context):
         logger.error("Invalid or missing file key in event: key=%s", key)
         return {"status": "error", "message": "Invalid or missing XML file key in event"}
 
-    # Validate that key starts with expected ingestion folder
-    if not key.startswith(f"{s3_ingestion_folder}/"):
-        logger.warning("Key '%s' does not start with expected folder '%s/'", key, s3_ingestion_folder)
-
     # get the input directory from the event itself
     input_dir = Path(key).resolve().parent
     input_dir.mkdir(parents=True, exist_ok=True)
 
     # the output dir is set in the env vars
-    output_dir = Path(os.environ.get('OUTPUT_DIR', ''))
+    output_dir = Path(os.environ.get('S3_OUTPUT_DIR', ''))
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # we can view any transformation intermediates in this dir (not in AWS Lambda)
     intermediate_dir = Path(os.environ.get('CTD_DATA_INTERMEDIATE', ''))
     intermediate_dir.mkdir(parents=True, exist_ok=True)
+
+    # whether to use subfolders in S3 output
+    use_level_subfolders = os.getenv("USE_LEVEL_SUBFOLDERS", "true").strip().lower() in ("1", "true", "yes", "y")
+    logger.info("S3 folders - Input: %s, Output: %s, Level subfolders: %s", 
+           input_dir, output_dir, use_level_subfolders)
 
     # Get merge flag from environment
     _merge_env = os.getenv("MERGE_XML")
@@ -221,7 +214,7 @@ def lambda_handler(event, context):
 
                     # Save the final transformed JSON
                     # Collect in memory by level (no disk writes except in DEBUG mode)
-                    if transformation_config.get("record_level_dirs"):
+                    if use_level_subfolders:
                         level = str(next((v for v in find_key(transformed_json, "catalogueLevel")), None))
                         dir_name = record_level_mapping.get(level, "UNKNOWN")
                         # Collect in memory by level
@@ -242,9 +235,12 @@ def lambda_handler(event, context):
     if jsons_by_level:
         with log_timing("Creating tarballs", logger):
             logger.info("Creating %d tarball(s) in memory...", len(jsons_by_level))
+            tree_name = Path(key).stem
+            level_tarballs = {}  # {level_name: tar_bytes}
             for level_name, files in jsons_by_level.items():
-                tarball_name = f"{level_name}_{Path(key).stem}.tar.gz"
-                
+                # Define tarball name as <original_filename>_<level_name>.tar.gz
+                tarball_name = f"{tree_name}_{level_name}.tar.gz"
+
                 # Build tarball in memory
                 buf = io.BytesIO()
                 try:
@@ -262,37 +258,56 @@ def lambda_handler(event, context):
                     logger.info("Created in-memory tarball: %s (%d files, %d bytes)", 
                                 tarball_name, file_count, len(tar_bytes))
                     
-                    # Write locally in local mode
+                    level_tarballs[level_name] = tar_bytes
+                    
+                    # Write tar by folder in local mode
                     if run_mode == "local":
                         tarball_path = output_dir / tarball_name
                         with tarball_path.open("wb") as f:
                             f.write(tar_bytes)
                         logger.info("Saved tarball locally: %s", tarball_path)
-                    
-                    # Upload to S3 in S3 modes (local_s3 or remote_s3)
-                    if run_mode in ["local_s3", "remote_s3"]:
-                        if not bucket:
-                            logger.error("No S3 bucket specified for upload")
-                            return {"status": "error", "message": "No S3 bucket specified"}
-                        
-                        # Build S3 key for egestion folder (with optional level subfolders)
-                        if use_level_subfolders:
-                            tar_key = f"{s3_egestion_folder}/{level_name}/{tarball_name}"
-                        else:
-                            tar_key = f"{s3_egestion_folder}/{tarball_name}"
-                        
-                        try:
-                            s3.put_object(Bucket=bucket, Key=tar_key, Body=tar_bytes)
-                            logger.info("Uploaded tarball to s3://%s/%s", bucket, tar_key)
-                        except ClientError as e:
-                            logger.exception("Error uploading tarball to S3: %s", 
-                                            e.response.get('Error', {}).get('Code'))
-                            return {"status": "error", 
-                                    "message": f"Error uploading tarball to S3: {e.response.get('Error', {}).get('Code')}"}
-                
+
                 except Exception:
                     logger.exception("Error creating tarball for level %s", level_name)
-                    return {"status": "error", "message": f"Error creating tarball for {level_name}"}
+                    return {"status": "error", "message": f"Error creating tarball for level {level_name}"}    
+                    
+            # Upload to S3 in S3 modes (local_s3 or remote_s3)
+            # we need to create a super-tarball containing all level tarballs
+            if run_mode in ["local_s3", "remote_s3"]:
+                if not bucket:
+                    logger.error("No S3 bucket specified for upload")
+                    return {"status": "error", "message": "No S3 bucket specified"}
+                
+                super_tarball_name = f"{tree_name}.tar.gz"
+                logger.info("Creating super-tarball: %s with %d level tarballs", super_tarball_name, len(level_tarballs))
+                
+                # Create super-tarball containing all level tarballs
+                super_buf = io.BytesIO()
+                with tarfile.open(fileobj=super_buf, mode="w:gz") as super_tar:
+                    for level_name, tar_bytes in level_tarballs.items():
+                        level_tarball_name = f"{tree_name}_{level_name}.tar.gz"
+                        ti = tarfile.TarInfo(name=level_tarball_name)
+                        ti.size = len(tar_bytes)
+                        ti.mtime = int(time.time())
+                        super_tar.addfile(ti, fileobj=io.BytesIO(tar_bytes))
+                        logger.info("Added %s to super-tarball (%d bytes)", level_tarball_name, len(tar_bytes))
+
+                super_buf.seek(0)
+                super_tar_bytes = super_buf.getvalue()
+                logger.info("Created super-tarball: %s (%d bytes)", super_tarball_name, len(super_tar_bytes))
+                
+                # Upload to json_outputs folder in S3
+                tar_key = f"{output_dir}/{super_tarball_name}"
+                try:
+                    s3.put_object(Bucket=bucket, Key=tar_key, Body=super_tar_bytes)
+                    logger.info("Uploaded tarball to s3://%s/%s", bucket, tar_key)
+                except ClientError as e:
+                    logger.exception("Error uploading tarball to S3: %s", 
+                                    e.response.get('Error', {}).get('Code'))
+                    return {"status": "error", 
+                            "message": f"Error uploading super-tarball to S3: {e.response.get('Error', {}).get('Code')}"}
+                
+
 
     if len(successfully_transformed_files) > 0:
         logger.info("Processed %s successfully", key)
