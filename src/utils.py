@@ -69,17 +69,18 @@ def log_timing(operation_name: str, logger: Optional[logging.Logger] = None):
         logger = logging.getLogger(__name__)
     
     start = time.perf_counter()
-    start_ts = datetime.utcnow().isoformat()
+    start_ts = datetime.now().isoformat()
     logger.info("Started %s at %s", operation_name, start_ts)
     
     try:
         yield
     finally:
         duration = time.perf_counter() - start
+        hh = int(duration // 3600)
         mm = int(duration // 60)
         ss = duration % 60
-        end_ts = datetime.utcnow().isoformat()
-        logger.info("Finished %s at %s (duration %dm %.2fs)", operation_name, end_ts, mm, ss)
+        end_ts = datetime.now().isoformat()
+        logger.info("Finished %s at %s (duration %dh %dm %.2fs)", operation_name.lower(), end_ts, hh, mm, ss)
 
 
 

@@ -14,3 +14,6 @@ trigger.json
 # temp buckets
 xml_input/
 json_outputs/
+
+notebooks/*
+!notebooks/testing_*.ipynb
