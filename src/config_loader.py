@@ -41,6 +41,8 @@ class UniversalConfig:
                 value = value.get(k, {})
             if value != {}:
                 return value
+        elif key_path in self.yaml_config:
+            return self.yaml_config[key_path]
 
         # Check JSON
         if key_path in self.json_config:

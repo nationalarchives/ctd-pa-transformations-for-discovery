@@ -17,6 +17,7 @@ import contextlib
 import time
 import logging
 from datetime import datetime
+import json
 
 def set_project_root(marker: str = "README.md") -> str:
     """
@@ -198,3 +199,29 @@ __all__ = [
     "list_xml_files",
     "merge_xml_files",
 ]
+
+def _load_json_file(path: Optional[str], logger) -> dict:
+    """Load JSON from a file path or from a JSON string stored in an env var.
+    Returns an empty dict on error or when no input provided.
+    """
+    if not path:
+        return {}
+
+    s = str(path).strip()
+
+    # 1) If it looks like an existing file (absolute or relative), load it
+    p = Path(s)
+    if p.exists():
+        try:
+            with p.open("r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except Exception:
+            logger.exception("Error reading JSON file %s", p)
+            return {}
+
+    # 3) Finally, try parsing the string itself as JSON content
+    try:
+        return json.loads(s)
+    except Exception:
+        logger.exception("TRANS_CONFIG value is not a valid JSON string or file: %s", s[:200])
+        return {}
