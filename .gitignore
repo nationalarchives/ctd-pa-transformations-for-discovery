@@ -8,3 +8,12 @@ scripts/
 trigger.json
 *.env
 *.pyc
+
+/logs/
+
+# temp buckets
+xml_input/
+json_outputs/
+
+notebooks/*
+!notebooks/testing_*.ipynb

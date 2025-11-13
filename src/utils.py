@@ -13,6 +13,10 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Iterable, List, Optional, Sequence, Union
 from dotenv import load_dotenv
+import contextlib
+import time
+import logging
+from datetime import datetime
 
 def set_project_root(marker: str = "README.md") -> str:
     """
@@ -44,6 +48,39 @@ def find_key(obj, target):
     elif isinstance(obj, list):
         for item in obj:
             yield from find_key(item, target)
+
+
+@contextlib.contextmanager
+def log_timing(operation_name: str, logger: Optional[logging.Logger] = None):
+    """Context manager to log start time, end time, and duration of an operation.
+    
+    Usage:
+        with log_timing("XML conversion", logger):
+            convert_to_json(...)
+    
+    Parameters
+    ----------
+    operation_name : str
+        Description of the operation being timed
+    logger : logging.Logger | None
+        Logger instance to use. If None, uses root logger.
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    start = time.perf_counter()
+    start_ts = datetime.now().isoformat()
+    logger.info("Started %s at %s", operation_name, start_ts)
+    
+    try:
+        yield
+    finally:
+        duration = time.perf_counter() - start
+        hh = int(duration // 3600)
+        mm = int(duration // 60)
+        ss = duration % 60
+        end_ts = datetime.now().isoformat()
+        logger.info("Finished %s at %s (duration %dh %dm %.2fs)", operation_name.lower(), end_ts, hh, mm, ss)
 
 
 
@@ -126,6 +163,8 @@ def merge_xml_files(
         The merged XML tree in memory.
     """
     files = list_xml_files(triggers_dir, filenames=filenames)
+    #files = [f for f in files if "merged" not in str(f).lower() and "tree" not in str(f).lower()]
+    files = [f for f in files if any(x in str(f).lower() for x in ['fonds', 'series', 'item', 'file'])]
     merged_root = ET.Element(root_tag)
     print(f"Merging {len(files)} XML files from {triggers_dir or get_triggers_dir()}:")
     for f in files:
@@ -154,6 +193,7 @@ def merge_xml_files(
 __all__ = [
     "set_project_root",
     "find_key",
+    "log_timing",
     "get_triggers_dir",
     "list_xml_files",
     "merge_xml_files",

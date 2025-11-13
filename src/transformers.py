@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import re
 import os
 import logging
+import sys
 
 
 def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = True):
@@ -102,6 +103,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
     records = {}
     print(f"length of root records: {len(list(root.iter('record')))}")
+    _total_records = len(list(root.iter('record')))
     for i, record in enumerate (root.iter('record')):
         
     ######################## Find_CALM_Record_ID_Element ###########################################################
@@ -875,6 +877,8 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         
         # update diagnostics
         _records_processed += 1
+        print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
+        sys.stdout.flush()
 
     print(f"{len(records)} records processed from the XML file.")
     return records
@@ -1199,18 +1203,15 @@ class YNamingTransformer():
             # (caller should load the set for stricter behavior)
             if self._refs is None:
                 result = self._apply_y_naming(text)
-                if result != text:
-                    self.logger.debug(f"Applied Y naming to whole field: '{text}' -> '{result}'")
                 return result
             # exact membership check
             if text in self._refs:
                 result = self._apply_y_naming(text)
-                if result != text:
-                    self.logger.debug(f"Applied Y naming to definitive reference: '{text}' -> '{result}'")
                 return result
             return text
 
         # Otherwise, attempt to find embedded reference-like tokens anywhere in the text
+        """
         try:
             new_text = self._replace_embedded_references(text)
             if new_text != text:
@@ -1220,6 +1221,9 @@ class YNamingTransformer():
             self.logger.warning(f"Error processing embedded references in '{text}': {e}")
             # On any unexpected error, fall back to original text
             return text
+        """
+        return text
+    
 
     def _replace_embedded_references(self, text: str) -> str:
         """Find embedded reference-like tokens in `text` and replace each with its Y-named equivalent.
@@ -1436,7 +1440,6 @@ class YNamingTransformer():
                 new_prefix = temp_prefix
 
         result = new_prefix + suffix
-        self.logger.debug(f"Applied Y naming: '{text}' -> '{result}'")
         return result
 
     def _transform_all_strings_json(self, obj, json_id, log_transformation):
@@ -1450,9 +1453,6 @@ class YNamingTransformer():
                         new = self.apply_if_reference(original)
                         if new != original:
                             current_obj[key] = new
-                            self.logger.info(f"Transformed string at path '{current_path}': '{original}' -> '{new}'")
-                            if json_id is not None and log_transformation:
-                                log_transformation(json_id, header=current_path, desc='Applied Y naming', match=True, orig_ranges=None, trans_ranges=None)
                     else:
                         _recurse_and_transform(value, current_path)
             elif isinstance(current_obj, list):
@@ -1463,9 +1463,6 @@ class YNamingTransformer():
                         new = self.apply_if_reference(original)
                         if new != original:
                             current_obj[i] = new
-                            self.logger.info(f"Transformed string at path '{current_path}': '{original}' -> '{new}'")
-                            if json_id is not None and log_transformation:
-                                log_transformation(json_id, header=current_path, desc='Applied Y naming', match=True, orig_ranges=None, trans_ranges=None)
                     else:
                         _recurse_and_transform(item, current_path)
         _recurse_and_transform(obj)
