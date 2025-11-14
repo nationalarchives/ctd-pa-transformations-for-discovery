@@ -16,11 +16,12 @@ repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
 
 from src.config_loader import UniversalConfig
-from src.utils import find_key, merge_xml_files, log_timing, _load_json_file
+from src.utils import find_key, merge_xml_files, log_timing, _load_json_file    
+from src.utils import load_manifest, save_manifest, filter_new_records, update_manifest_with_records
 from src.transformers import NewlineToPTransformer, YNamingTransformer, convert_to_json
 
 
-# load in the environment variables from .env in repo root (this is done by AWS Lambda automatically)
+# load in the environment variables from .env in repo root (done by AWS Lambda automatically)
 if not os.getenv("AWS_LAMBDA_FUNCTION_NAME") and not os.getenv("AWS_EXECUTION_ENV"):
     UniversalConfig(env_file=repo_root / ".env")
 
@@ -71,13 +72,12 @@ if run_mode in ["local", "local_s3"]:
     logger.addHandler(file_handler)
 
 
-# Helper to load trigger JSON at module import
-# ...existing code...
-
-
 # define pipeline configuration separately from event
 transformations_str = os.environ.get("TRANS_CONFIG")
 transformation_config = _load_json_file(transformations_str, logger=logger)
+
+# Manifest configuration
+manifest_filename = os.getenv("MANIFEST_FILENAME", "uploaded_records_manifest.json")
 
 def lambda_handler(event, context):
     
@@ -85,11 +85,6 @@ def lambda_handler(event, context):
     record = event['Records'][0]
     bucket = record['s3']['bucket']['name']
     key = record['s3']['object']['key']
-
-    # Validate key exists and is an XML file
-    if not key or not key.endswith(".xml"):
-        logger.error("Invalid or missing file key in event: key=%s", key)
-        return {"status": "error", "message": "Invalid or missing XML file key in event"}
 
     # get the input directory from the event itself
     input_dir = Path(key).resolve().parent
@@ -99,12 +94,41 @@ def lambda_handler(event, context):
     output_dir = Path(os.environ.get('S3_OUTPUT_DIR', ''))
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Validate key exists and is an XML file
+    if not key or not key.endswith(".xml"):
+        logger.error("Invalid or missing file key in event: key=%s", key)
+        return {"status": "error", "message": "Invalid or missing XML file key in event"}
+    
+    # Load manifest for deduplication (only in S3 modes)
+    manifest = None
+    if run_mode in ["local_s3", "remote_s3"]:
+        if not manifest_filename:
+            logger.error("MANIFEST_FILENAME environment variable is not set")
+            return {
+                "status": "error",
+                "message": "MANIFEST_FILENAME environment variable is required"
+            }
+        try:
+            manifest = load_manifest(manifest_filename, s3, bucket, output_dir, logger)
+            num_existing = len(manifest.get('records', {}))
+            logger.info("Loaded manifest with %d existing records", num_existing)
+        except Exception as e:
+            logger.exception("FATAL: Failed to load manifest - cannot proceed without deduplication")
+            return {
+                "status": "error",
+                "message": f"Failed to load deduplication manifest: {str(e)}"
+            }
+    else:
+        manifest = None
+        logger.info("Running in local mode - skipping manifest/deduplication")
+
     # we can view any transformation intermediates in this dir (not in AWS Lambda)
     intermediate_dir = Path(os.environ.get('CTD_DATA_INTERMEDIATE', ''))
     intermediate_dir.mkdir(parents=True, exist_ok=True)
 
     # whether to use subfolders in S3 output
-    use_level_subfolders = os.getenv("USE_LEVEL_SUBFOLDERS", "true").strip().lower() in ("1", "true", "yes", "y")
+    truthy_chars = ("1", "true", "yes", "y")
+    use_level_subfolders = os.getenv("USE_LEVEL_SUBFOLDERS", "true").strip().lower() in truthy_chars
     logger.info("S3 folders - Input: %s, Output: %s, Level subfolders: %s", 
            input_dir, output_dir, use_level_subfolders)
 
@@ -113,7 +137,7 @@ def lambda_handler(event, context):
     if _merge_env is None:
         merge_xml = False
     else:
-        merge_xml = str(_merge_env).strip().lower() in ("1", "true", "yes", "y")
+        merge_xml = str(_merge_env).strip().lower() in truthy_chars
 
     # 2. Determine source: local file or S3 download
     xml_path_to_convert = None
@@ -128,8 +152,10 @@ def lambda_handler(event, context):
             xml_path_to_convert = tmp_path
             logger.info("Downloaded %s from S3 bucket %s", key, bucket)
         except ClientError as e:
-            logger.exception("Error downloading %s from S3: %s", key, e.response.get('Error', {}).get('Code'))
-            return {"status": "error", "message": f"Error downloading {key} from S3: {e.response.get('Error', {}).get('Code')}"}
+            logger.exception("Error downloading %s from S3: %s", key, 
+                             e.response.get('Error', {}).get('Code'))
+            return {"status": "error", "message": f"Error downloading {key} from S3: "
+                    f"{e.response.get('Error', {}).get('Code')}"}
     else:
         # Local mode: file must exist locally
         logger.info("Running in local mode - using local file system")
@@ -149,13 +175,25 @@ def lambda_handler(event, context):
     print(f"input_dir: {input_dir}")
     if not xml_path_to_convert.exists() or not xml_path_to_convert.is_file():
         logger.error("Local XML file not found: %s", xml_path_to_convert)
-        return {"status": "error", "message": f"Local XML file not found: {xml_path_to_convert}"}
+        return {"status": "error", "message": f"Local XML file not found: "
+                f"{xml_path_to_convert}"}
     
     # 3. Convert XML to JSON
     try:
         with log_timing(f"XML to JSON conversion ({xml_path_to_convert.name})", logger):
-            records = convert_to_json(xml_path=str(xml_path_to_convert), output_dir=str(output_dir))
+            records = convert_to_json(xml_path=str(xml_path_to_convert), 
+                                      output_dir=str(output_dir))
         logger.info("Converted %d records", len(records))
+        
+        # Filter out records that have already been uploaded
+        if manifest is not None:
+            original_count = len(records)
+            records = filter_new_records(records, manifest, logger)
+            filtered_count = original_count - len(records)
+            if filtered_count > 0:
+                logger.info("Filtered out %d already-uploaded records, %d new records remaining", 
+                           filtered_count, len(records))
+        
         for f in output_dir.iterdir():
             logger.debug("  %s", f.name)
     except Exception:
@@ -173,7 +211,7 @@ def lambda_handler(event, context):
     converted_xml_to_json_files = records
 
     # save the converted files to disk to investigation - remove this in the future
-    save_intermediate = os.getenv("SAVE_INTERMEDIATE_JSON", "true").strip().lower() in ("1", "true", "yes", "y")
+    save_intermediate = os.getenv("SAVE_INTERMEDIATE_JSON", "true").strip().lower() in truthy_chars
     if save_intermediate and run_mode in ["local", "local_s3"]:
         for filename, _file in converted_xml_to_json_files.items():
             output_file = intermediate_dir / f"{filename}.json"
@@ -197,7 +235,8 @@ def lambda_handler(event, context):
                 if len(transformation_config) == 0 or len(record_level_mapping) == 0:
                     logger.error("transformation_config: %s", transformation_config)
                     logger.error("record_level_mapping: %s", record_level_mapping)
-                    return {"status": "error", "message": "Transformation config or record level mapping is missing or empty"}
+                    return {"status": "error", "message": "Transformation config or record "
+                                                            "level mapping is missing or empty"}
 
                 # do the transformations
                 try:
@@ -215,7 +254,8 @@ def lambda_handler(event, context):
                     # Save the final transformed JSON
                     # Collect in memory by level (no disk writes except in DEBUG mode)
                     if use_level_subfolders:
-                        level = str(next((v for v in find_key(transformed_json, "catalogueLevel")), None))
+                        level = str(next((v for v in find_key(transformed_json, 
+                                                              "catalogueLevel")), None))
                         dir_name = record_level_mapping.get(level, "UNKNOWN")
                         # Collect in memory by level
                         if dir_name not in jsons_by_level:
@@ -227,8 +267,10 @@ def lambda_handler(event, context):
                             jsons_by_level["root"] = []
                         jsons_by_level["root"].append((filename, transformed_json))
                 except Exception:
-                    logger.exception("Error applying transformations for file %s", f"{filename}.json")
-                    return {"status": "error", "message": f"Error applying transformations for {filename}.json"}
+                    logger.exception("Error applying transformations for file %s",
+                                     f"{filename}.json")
+                    return {"status": "error", "message": f"Error applying "
+                            f"transformations for {filename}.json"}
                 successfully_transformed_files.append(filename)
 
     # Create in-memory tarballs for each level
@@ -246,7 +288,8 @@ def lambda_handler(event, context):
                 try:
                     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
                         for filename, json_data in files:
-                            json_bytes = json.dumps(json_data, ensure_ascii=False, indent=2).encode("utf-8")
+                            json_bytes = json.dumps(json_data, ensure_ascii=False, 
+                                                    indent=2).encode("utf-8")
                             ti = tarfile.TarInfo(name=f"{filename}.json")
                             ti.size = len(json_bytes)
                             ti.mtime = int(time.time())
@@ -269,7 +312,8 @@ def lambda_handler(event, context):
 
                 except Exception:
                     logger.exception("Error creating tarball for level %s", level_name)
-                    return {"status": "error", "message": f"Error creating tarball for level {level_name}"}    
+                    return {"status": "error", "message": f"Error creating tarball "
+                            f"for level {level_name}"}    
                     
             # Upload to S3 in S3 modes (local_s3 or remote_s3)
             # we need to create a super-tarball containing all level tarballs
@@ -279,7 +323,8 @@ def lambda_handler(event, context):
                     return {"status": "error", "message": "No S3 bucket specified"}
                 
                 super_tarball_name = f"{tree_name}.tar.gz"
-                logger.info("Creating super-tarball: %s with %d level tarballs", super_tarball_name, len(level_tarballs))
+                logger.info("Creating super-tarball: %s with %d level tarballs", 
+                            super_tarball_name, len(level_tarballs))
                 
                 # Create super-tarball containing all level tarballs
                 super_buf = io.BytesIO()
@@ -290,22 +335,36 @@ def lambda_handler(event, context):
                         ti.size = len(tar_bytes)
                         ti.mtime = int(time.time())
                         super_tar.addfile(ti, fileobj=io.BytesIO(tar_bytes))
-                        logger.info("Added %s to super-tarball (%d bytes)", level_tarball_name, len(tar_bytes))
+                        logger.info("Added %s to super-tarball (%d bytes)", 
+                                    level_tarball_name, len(tar_bytes))
 
                 super_buf.seek(0)
                 super_tar_bytes = super_buf.getvalue()
-                logger.info("Created super-tarball: %s (%d bytes)", super_tarball_name, len(super_tar_bytes))
+                logger.info("Created super-tarball: %s (%d bytes)", 
+                            super_tarball_name, len(super_tar_bytes))
                 
                 # Upload to json_outputs folder in S3
                 tar_key = f"{output_dir}/{super_tarball_name}"
                 try:
                     s3.put_object(Bucket=bucket, Key=tar_key, Body=super_tar_bytes)
                     logger.info("Uploaded tarball to s3://%s/%s", bucket, tar_key)
+                    
+                    # Update manifest with newly uploaded records
+                    if manifest is not None:
+                        manifest = update_manifest_with_records(manifest, converted_xml_to_json_files, 
+                                                                key, bucket, output_dir, logger)
+                        try:
+                            save_manifest(manifest_filename, s3, bucket, output_dir, manifest, logger)
+                            logger.info("Updated manifest with %d total records", len(manifest.get('records', {})))
+                        except Exception:
+                            logger.exception("Error saving manifest (non-fatal)")
+                            
                 except ClientError as e:
                     logger.exception("Error uploading tarball to S3: %s", 
                                     e.response.get('Error', {}).get('Code'))
                     return {"status": "error", 
-                            "message": f"Error uploading super-tarball to S3: {e.response.get('Error', {}).get('Code')}"}
+                            "message": f"Error uploading super-tarball to S3:"
+                                f" {e.response.get('Error', {}).get('Code')}"}
                 
 
 

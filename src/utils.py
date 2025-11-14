@@ -225,3 +225,126 @@ def _load_json_file(path: Optional[str], logger) -> dict:
     except Exception:
         logger.exception("TRANS_CONFIG value is not a valid JSON string or file: %s", s[:200])
         return {}
+    
+# manifest helpers    
+def load_manifest(manifest_filename, s3, bucket, s3_output_folder, logger):
+    """Load the manifest of uploaded records from S3"""
+    manifest_key = f"{s3_output_folder}/{manifest_filename}"
+    
+    try:
+        response = s3.get_object(Bucket=bucket, Key=manifest_key)
+        manifest = json.loads(response['Body'].read().decode('utf-8'))
+        logger.info("Loaded manifest with %d records", len(manifest.get('records', {})))
+        return manifest
+    except s3.exceptions.NoSuchKey:
+        logger.info("Manifest file not found, creating new one")
+        return {"last_updated": None, "total_records": 0, "records": {}}
+    except Exception as e:
+        logger.exception("Error loading manifest: %s", e)
+        return {"last_updated": None, "total_records": 0, "records": {}}
+
+def save_manifest(manifest_filename, s3, bucket, output_dir, manifest, logger):
+    """Save the manifest of uploaded records to S3 (with timestamped backup of existing)"""
+    manifest_key = f"{output_dir}/{manifest_filename}"
+    
+    try:
+        # Check if manifest already exists and create a backup copy
+        try:
+            s3.head_object(Bucket=bucket, Key=manifest_key)
+            # Manifest exists, create timestamped backup
+            timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            base_name = Path(manifest_filename).stem
+            ext = Path(manifest_filename).suffix
+            backup_filename = f"{base_name}_copy_{timestamp}{ext}"
+            backup_key = f"{output_dir}/{backup_filename}"
+            
+            # Copy existing manifest to backup
+            s3.copy_object(
+                Bucket=bucket,
+                CopySource={'Bucket': bucket, 'Key': manifest_key},
+                Key=backup_key
+            )
+            logger.info("Created backup of existing manifest: s3://%s/%s", bucket, backup_key)
+        except s3.exceptions.ClientError as e:
+            if e.response['Error']['Code'] == '404':
+                # Manifest doesn't exist yet, no backup needed
+                logger.info("No existing manifest to backup")
+            else:
+                raise
+        
+        # Save the new manifest
+        manifest['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        manifest['total_records'] = len(manifest.get('records', {}))
+        
+        manifest_json = json.dumps(manifest, indent=2, ensure_ascii=False)
+        s3.put_object(
+            Bucket=bucket,
+            Key=manifest_key,
+            Body=manifest_json.encode('utf-8'),
+            ContentType='application/json'
+        )
+        logger.info("Saved manifest with %d total records to s3://%s/%s", 
+                   manifest['total_records'], bucket, manifest_key)
+    except Exception as e:
+        logger.exception("Error saving manifest: %s", e)
+
+def filter_new_records(records, manifest, logger):
+    """Filter out already-uploaded records using manifest"""
+    uploaded_iaids = set(manifest.get('records', {}).keys())
+    new_records = {}
+    skipped_count = 0
+    
+    for iaid, record_data in records.items():
+        if iaid in uploaded_iaids:
+            logger.debug("Skipping already-uploaded record: %s", iaid)
+            skipped_count += 1
+            continue
+        
+        new_records[iaid] = record_data
+    
+    logger.info("Filtered %d new records (skipped %d duplicates)", 
+               len(new_records), skipped_count)
+    return new_records
+
+def update_manifest_with_records(manifest, records, source_file, bucket, s3_output_folder, logger):
+    """Add newly uploaded records to manifest (excluding the deepest/leaf level in this tree)"""
+    if 'records' not in manifest:
+        manifest['records'] = {}
+    
+    # Find the deepest level in this tree
+    max_level = 0
+    for iaid, record_data in records.items():
+        catalogue_level = record_data.get('record', {}).get('catalogueLevel', 0)
+        if catalogue_level > max_level:
+            max_level = catalogue_level
+    
+    logger.info("Tree max catalogue level: %d - will track all levels except %d", max_level, max_level)
+    
+    added_count = 0
+    skipped_count = 0
+    
+    for iaid, record_data in records.items():
+        catalogue_level = record_data.get('record', {}).get('catalogueLevel', 0)
+        
+        # Skip the deepest level (leaf records that are unique per tree)
+        if catalogue_level == max_level:
+            logger.debug("Skipping leaf record %s (level %d)", iaid, catalogue_level)
+            skipped_count += 1
+            continue
+        
+        manifest['records'][iaid] = {
+            'reference': record_data.get('record', {}).get('citableReference', 'N/A'),
+            'uploaded_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'uploaded_to': f"s3://{bucket}/{s3_output_folder}",
+            'source_file': source_file,
+            'QA_status': {
+                'checked_complete': False,
+                'checked_by': None,
+                'check_complete_date': None
+            },
+            'catalogue_level': catalogue_level
+        }
+        added_count += 1
+    
+    logger.info("Added %d records to manifest, skipped %d leaf records", added_count, skipped_count)
+    return manifest
