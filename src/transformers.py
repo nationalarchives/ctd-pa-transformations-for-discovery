@@ -904,19 +904,10 @@ class NewlineToPTransformer():
         # — we want to preserve trailing newlines so they get replaced too.
         text = s.replace('\r\n', '\n').replace('\r', '\n')
 
-        # If punctuation (period, question, exclamation) appears immediately
-        # before whitespace + newline(s) we want to remove that punctuation so
-        # "test. \n" -> "test <p>" (matches notebook expectations).
-        # Replace punctuation + whitespace + newline+ with a single space + <p>.
         try:
-            # remove punctuation characters that occur immediately before
-            # whitespace + newline(s) but do NOT consume the newline chars.
-            # e.g. 'test. \n' -> 'test \n' so later '\n' -> '<p>'
-            text = re.sub(r"([\.\?!])(?=\s*\n)", '', text)
             return self.regex.sub(self.replace, text)
         except Exception:
-            # fallback: remove punctuation before newline and collapse newlines
-            text = re.sub(r"([\.\?!])(?=\s*\n)", '', text)
+            # fallback: just replace newlines
             return re.sub(r'\n+', self.replace, text)
 
     def _walk_and_transform(self, obj):
@@ -1185,7 +1176,6 @@ class YNamingTransformer():
         # Delegate to transform_json; apply to all if target_columns is None
         return self.transform_json(data, target_columns=self.target_columns, json_id=json_id)
         
-        
     # regex to find embedded candidate tokens: requires at least one slash
     _embedded_token_re = re.compile(r'([A-Z0-9-]+(?:/[A-Z0-9-]+)+/?)')
 
@@ -1211,7 +1201,6 @@ class YNamingTransformer():
             return text
 
         # Otherwise, attempt to find embedded reference-like tokens anywhere in the text
-        """
         try:
             new_text = self._replace_embedded_references(text)
             if new_text != text:
@@ -1221,8 +1210,6 @@ class YNamingTransformer():
             self.logger.warning(f"Error processing embedded references in '{text}': {e}")
             # On any unexpected error, fall back to original text
             return text
-        """
-        return text
     
 
     def _replace_embedded_references(self, text: str) -> str:
@@ -1263,62 +1250,58 @@ class YNamingTransformer():
         If fields is None, apply to ALL string values in the JSON recursively.
         """
         obj = copy.deepcopy(data)
-        try:
-            from src.diagnostics_db import log_transformation
-        except Exception:
-            log_transformation = None
 
         # Important: treat fields=None as the signal to apply to ALL string values.
         # If caller passes an explicit list (possibly empty), only those fields are processed.
         if target_columns is None:
             # Apply to all string values recursively
-            self._transform_all_strings_json(obj, json_id, log_transformation)
-        else:
-            # Use the explicit fields list provided by the caller
-            for field in target_columns:
-                candidates = [field]
-                if field.startswith('record.'):
-                    candidates.append(field[len('record.'):])
-                else:
-                    candidates.append('record.' + field)
+            self._transform_all_strings_json(obj, json_id)
+            return obj
 
-                for candidate in candidates:
-                    # inspect value before and after transformation so we can compute ranges
-                    # navigate to the value location to capture the original string
-                    def _get_value_for_field(obj_in, field_path):
-                        parts = field_path.split('.')
-                        cur = obj_in
-                        for i, part in enumerate(parts):
-                            if '[' in part and part.endswith(']'):
-                                name, idx = part[:-1].split('[')
-                                try:
-                                    idx = int(idx)
-                                except Exception:
-                                    return None
-                                if name:
-                                    cur = cur.get(name, []) if isinstance(cur, dict) else None
-                                if isinstance(cur, list) and len(cur) > idx:
-                                    if i == len(parts) - 1:
-                                        return cur[idx] if isinstance(cur[idx], str) else None
-                                    cur = cur[idx]
-                                else:
-                                    return None
-                            else:
-                                if i == len(parts) - 1:
-                                    return cur.get(part) if isinstance(cur, dict) else None
-                                cur = cur.get(part, None) if isinstance(cur, dict) else None
-                        return None
+        # Explicit list of target columns: transform only those paths (string or nested containers)
+        for field in target_columns:
+            candidates = [field]
+            if field.startswith('record.'):
+                candidates.append(field[len('record.'):])
+            else:
+                candidates.append('record.' + field)
 
-                    original_val = _get_value_for_field(data, candidate)
-                    changed = self._transform_field_json(obj, candidate)
-                    if changed and json_id is not None and log_transformation:
-                        # compute ranges between original_val and the new value in obj
-                        new_val = _get_value_for_field(obj, candidate)
-                        orig_ranges, trans_ranges = self._compute_ranges_for_pair(original_val, new_val)
-                        log_transformation(json_id, header=candidate, desc='Applied Y naming', match=True, orig_ranges=orig_ranges, trans_ranges=trans_ranges)
-                        break
-
+            for candidate in candidates:
+                if self._transform_target_path(obj, candidate):
+                    break  # stop after first matching candidate variant
         return obj
+
+    def _transform_target_path(self, obj: dict, path: str) -> bool:
+        """Apply transformation at a dotted path.
+        If final value is:
+          - string: transform directly
+          - dict/list: recurse inside it (all strings)
+        Returns True if any change occurred.
+        """
+        parts = path.split('.')
+        cur = obj
+        for i, part in enumerate(parts):
+            last = (i == len(parts) - 1)
+            if not isinstance(cur, dict) or part not in cur:
+                return False
+            val = cur[part]
+            if last:
+                if isinstance(val, str):
+                    new_val = self.apply_if_reference(val)
+                    if new_val != val:
+                        cur[part] = new_val
+                        return True
+                    return False
+                if isinstance(val, (dict, list)):
+                    # snapshot before
+                    before = json.dumps(val, ensure_ascii=False, sort_keys=True) if isinstance(val, dict) else str(val)
+                    self._transform_all_strings_json(val, json_id=None)
+                    after = json.dumps(val, ensure_ascii=False, sort_keys=True) if isinstance(val, dict) else str(val)
+                    return before != after
+                return False
+            else:
+                cur = val
+        return False
 
     def _transform_field_json(self, obj, field_path):
         parts = field_path.split('.')
@@ -1442,7 +1425,7 @@ class YNamingTransformer():
         result = new_prefix + suffix
         return result
 
-    def _transform_all_strings_json(self, obj, json_id, log_transformation):
+    def _transform_all_strings_json(self, obj, json_id):
         """Recursively apply Y-naming to all string values in the JSON object."""
         def _recurse_and_transform(current_obj, path=""):
             if isinstance(current_obj, dict):
@@ -1480,8 +1463,9 @@ class YNamingTransformer():
         if len(s) < 2 or len(s) > 250:
             return False
 
-        # explicit exception for "APT/" anywhere in the original text
-        if re.search(r'(?i)\bAPT\s*/', orig):
+        # explicit exclusion: any token starting with "APT/" should be rejected (case-insensitive)
+        # We use a word boundary before APT to avoid matching inside longer tokens like CAPT/.
+        if re.search(r'(?i)\bAPT/', orig):
             return False
 
         # check that the token contains 1 to 9 slashes
@@ -1489,15 +1473,26 @@ class YNamingTransformer():
         if slash_count < 1 or slash_count > 9:
             return False
 
-        toks = [t.strip() for t in s.split('/')]
+        raw_toks = s.split('/')
+        toks = [t.strip() for t in raw_toks]
         if len(toks) < 2 or len(toks) > 10:
             return False
 
-        # no empty tokens allowed (reject trailing slash-only cases like "ABC/")
-        for tok in toks:
+        # Reject if any token had leading/trailing whitespace originally (e.g. ' DEF')
+        for raw, tok in zip(raw_toks, toks):
+            if raw != tok:
+                return False
             if tok == '':
                 return False
             if not re.match(r'^[A-Za-z0-9-]+$', tok):
                 return False
+
+        # Additional rule: first (prefix) token must be purely alphabetic (no digits or hyphens)
+        # This enforces rejection of examples like 'XYZ-12/ABC-3' and 'A1B2C3/456'.
+        if not re.match(r'^[A-Za-z]+$', toks[0]):
+            return False
+        # Prefix must be at least 2 alphabetic characters (reject single-letter like 'A/1').
+        if len(toks[0]) < 2:
+            return False
 
         return True

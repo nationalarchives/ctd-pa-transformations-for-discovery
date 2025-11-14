@@ -16,7 +16,7 @@ repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
 
 from src.config_loader import UniversalConfig
-from src.utils import find_key, merge_xml_files, log_timing, _load_json_file    
+from src.utils import find_key, merge_xml_files, log_timing, _load_json_file, filter_xml_by_iaid
 from src.utils import load_manifest, save_manifest, filter_new_records, update_manifest_with_records
 from src.transformers import NewlineToPTransformer, YNamingTransformer, convert_to_json
 
@@ -178,6 +178,23 @@ def lambda_handler(event, context):
         return {"status": "error", "message": f"Local XML file not found: "
                 f"{xml_path_to_convert}"}
     
+    # Filter XML by IAID in local mode (for quick testing of single records)
+    filter_iaid = os.getenv("FILTER_IAID")
+    if filter_iaid and run_mode == "local":
+        logger.info("FILTER_IAID set: filtering XML for IAID %s", filter_iaid)
+        filtered_xml_path = input_dir / f"filtered_{filter_iaid}.xml"
+        try:
+            xml_path_to_convert = filter_xml_by_iaid(
+                xml_path_to_convert, 
+                filter_iaid, 
+                filtered_xml_path, 
+                logger
+            )
+            logger.info("Using filtered XML: %s", xml_path_to_convert)
+        except ValueError as e:
+            logger.error("Failed to filter XML: %s", e)
+            return {"status": "error", "message": str(e)}
+    
     # 3. Convert XML to JSON
     try:
         with log_timing(f"XML to JSON conversion ({xml_path_to_convert.name})", logger):
@@ -210,9 +227,9 @@ def lambda_handler(event, context):
     # 4. Load the converted JSON (convert_xml_to_json should have written it)
     converted_xml_to_json_files = records
 
-    # save the converted files to disk to investigation - remove this in the future
-    save_intermediate = os.getenv("SAVE_INTERMEDIATE_JSON", "true").strip().lower() in truthy_chars
-    if save_intermediate and run_mode in ["local", "local_s3"]:
+    # save the converted files to disk to investigation if option selected
+    save_intermediate = os.getenv("DEBUG_TRANSFORMERS", "true").strip().lower() in truthy_chars
+    if save_intermediate and run_mode == "local":
         for filename, _file in converted_xml_to_json_files.items():
             output_file = intermediate_dir / f"{filename}.json"
             try:
@@ -240,16 +257,36 @@ def lambda_handler(event, context):
 
                 # do the transformations
                 try:
+                    # Save pre-transformation JSON (before any transformers)
+                    save_intermediates = os.getenv("SAVE_INTERMEDIATE_JSON", "true").strip().lower() in truthy_chars
+                    if save_intermediates and run_mode == "local":
+                        pre_transform_dir = intermediate_dir / "pre_transformed"
+                        pre_transform_dir.mkdir(parents=True, exist_ok=True)
+                        pre_transform_file = pre_transform_dir / f"{filename}.json"
+                        with pre_transform_file.open("w", encoding="utf-8") as fh:
+                            json.dump(_file, fh, ensure_ascii=False, indent=2)
+                        logger.debug("Saved pre-transformed JSON: %s", pre_transform_file)
+                    
                     # newline to <p> transformation
                     transformed_json = None
                     task = transformation_config['tasks'].get('newline_to_p', {})
-                    n = NewlineToPTransformer(target_columns=None, **task.get('params', {}))
+                    n = NewlineToPTransformer(target_columns=task.get('target_columns'), 
+                                              **task.get('params', {}))
                     transformed_json = n.transform(_file)
 
                     # Y naming transformation
                     task = transformation_config['tasks'].get('y_naming')
-                    y = YNamingTransformer(target_columns=None)
+                    y = YNamingTransformer(target_columns=task.get('target_columns'))
                     transformed_json = y.transform(transformed_json)
+                    
+                    # Save post-transformation JSON (after all transformers)
+                    if save_intermediates and run_mode == "local":
+                        post_transform_dir = intermediate_dir / "post_transformed"
+                        post_transform_dir.mkdir(parents=True, exist_ok=True)
+                        post_transform_file = post_transform_dir / f"{filename}.json"
+                        with post_transform_file.open("w", encoding="utf-8") as fh:
+                            json.dump(transformed_json, fh, ensure_ascii=False, indent=2)
+                        logger.debug("Saved post-transformed JSON: %s", post_transform_file)
 
                     # Save the final transformed JSON
                     # Collect in memory by level (no disk writes except in DEBUG mode)
@@ -274,7 +311,7 @@ def lambda_handler(event, context):
                 successfully_transformed_files.append(filename)
 
     # Create in-memory tarballs for each level
-    if jsons_by_level:
+    if jsons_by_level and run_mode in ['local_s3', 'remote_s3']:
         with log_timing("Creating tarballs", logger):
             logger.info("Creating %d tarball(s) in memory...", len(jsons_by_level))
             tree_name = Path(key).stem

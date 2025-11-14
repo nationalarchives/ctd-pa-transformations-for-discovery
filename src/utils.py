@@ -225,6 +225,69 @@ def _load_json_file(path: Optional[str], logger) -> dict:
     except Exception:
         logger.exception("TRANS_CONFIG value is not a valid JSON string or file: %s", s[:200])
         return {}
+
+def filter_xml_by_iaid(xml_path: Union[str, Path], target_iaid: str, output_path: Union[str, Path], logger) -> Path:
+    """Filter XML to only include the record with specified citableReference.
+    
+    Parameters
+    ----------
+    xml_path : path-like
+        Path to input XML file
+    target_iaid : str
+        citableReference to filter for (e.g., "C12345")
+    output_path : path-like
+        Path where filtered XML will be saved
+    logger : logging.Logger
+        Logger instance
+    
+    Returns
+    -------
+    Path
+        Path to the filtered XML file
+    """
+    xml_path = Path(xml_path)
+    output_path = Path(output_path)
+    
+    logger.info("Filtering XML for alternative_number: %s", target_iaid)
+    
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    
+    # Find all record elements (not InformationObject - that's the root container)
+    found_record = None
+    for record in root.findall('.//record'):
+        # Look for alternative_number with type='CALM RecordID'
+        alt_num_elem = record.find("Alternative_number/[alternative_number.type='CALM RecordID']/alternative_number")
+        if alt_num_elem is not None and alt_num_elem.text and alt_num_elem.text.strip() == target_iaid:
+            found_record = record
+            logger.info("Found record with alternative_number %s", target_iaid)
+            break
+        
+        # Also try without the type filter (in case structure varies)
+        if found_record is None:
+            for alt_num in record.findall('.//alternative_number'):
+                if alt_num.text and alt_num.text.strip() == target_iaid:
+                    found_record = record
+                    logger.info("Found record with alternative_number %s (fallback search)", target_iaid)
+                    break
+            if found_record is not None:
+                break
+    
+    if found_record is None:
+        logger.warning("Record with alternative_number %s not found in XML file", target_iaid)
+        raise ValueError(f"Record with alternative_number {target_iaid} not found in {xml_path}")
+    
+    # Create new XML with just this record
+    new_root = ET.Element(root.tag, attrib=root.attrib)
+    new_root.append(found_record)
+    new_tree = ET.ElementTree(new_root)
+    
+    # Save filtered XML
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    new_tree.write(output_path, encoding='utf-8', xml_declaration=True)
+    logger.info("Saved filtered XML to %s", output_path)
+    
+    return output_path
     
 # manifest helpers    
 def load_manifest(manifest_filename, s3, bucket, s3_output_folder, logger):
