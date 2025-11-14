@@ -10,6 +10,9 @@ pyyaml==6.0.1              # YAML config file parsing
 pandas==2.3.3              # Data manipulation (if needed for transformations)
 numpy==2.3.4               # Numerical operations (pandas dependency)
 
+# Testing
+pytest==8.3.3              # Unit testing framework for transformer logic
+
 # Note: botocore is included with boto3
 # Standard library used: json, xml.etree.ElementTree, tarfile, io, pathlib, logging
 
