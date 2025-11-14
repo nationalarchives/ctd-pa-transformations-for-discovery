@@ -85,14 +85,15 @@ def lambda_handler(event, context):
     record = event['Records'][0]
     bucket = record['s3']['bucket']['name']
     key = record['s3']['object']['key']
+    raw_key = key # this is the <foldername>/<filename> in S3
 
-    # get the input directory from the event itself
-    input_dir = Path(key).resolve().parent
-    input_dir.mkdir(parents=True, exist_ok=True)
+    # Validate key exists and is an XML file
+    if not key or not key.endswith(".xml"):
+        logger.error("Invalid or missing file key in event: key=%s", key)
+        return {"status": "error", "message": "Invalid or missing XML file key in event"}
 
-    # the output dir is set in the env vars
-    output_dir = Path(os.environ.get('S3_OUTPUT_DIR', ''))
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # S3 output prefix only (no local dir creation for input)
+    output_prefix = os.environ.get('S3_OUTPUT_DIR', 'json_outputs').strip().strip('/')
 
     # Validate key exists and is an XML file
     if not key or not key.endswith(".xml"):
@@ -109,7 +110,7 @@ def lambda_handler(event, context):
                 "message": "MANIFEST_FILENAME environment variable is required"
             }
         try:
-            manifest = load_manifest(manifest_filename, s3, bucket, output_dir, logger)
+            manifest = load_manifest(manifest_filename, s3, bucket, output_prefix, logger)
             num_existing = len(manifest.get('records', {}))
             logger.info("Loaded manifest with %d existing records", num_existing)
         except Exception as e:
@@ -124,107 +125,91 @@ def lambda_handler(event, context):
 
     # we can view any transformation intermediates in this dir (not in AWS Lambda)
     intermediate_dir = Path(os.environ.get('CTD_DATA_INTERMEDIATE', ''))
-    intermediate_dir.mkdir(parents=True, exist_ok=True)
+    if run_mode == "local" and intermediate_dir:
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
 
     # whether to use subfolders in S3 output
     truthy_chars = ("1", "true", "yes", "y")
     use_level_subfolders = os.getenv("USE_LEVEL_SUBFOLDERS", "true").strip().lower() in truthy_chars
-    logger.info("S3 folders - Input: %s, Output: %s, Level subfolders: %s", 
-           input_dir, output_dir, use_level_subfolders)
+    
+    # whether to merge XML files from folder structure before processing
+    _merge_env = os.getenv("MERGE_XML", "false")
+    merge_xml = merge_xml = _merge_env.strip().lower() in truthy_chars
 
-    # Get merge flag from environment
-    _merge_env = os.getenv("MERGE_XML")
-    if _merge_env is None:
-        merge_xml = False
-    else:
-        merge_xml = str(_merge_env).strip().lower() in truthy_chars
+    # Work directory for temp files downloaded from S3
+    work_dir = Path("/tmp")
 
-    # 2. Determine source: local file or S3 download
+    # set other paths to None initially
     xml_path_to_convert = None
     tmp_path = None
 
     # Download from S3 in S3 modes (local_s3 or remote_s3)
     if run_mode in ["local_s3", "remote_s3"]:
-        # Download from S3 to a temp file
-        tmp_path = input_dir / f"tmp_{Path(key).name}"
+        tmp_path = work_dir / f"{Path(raw_key).name}"
         try:
-            s3.download_file(Bucket=bucket, Key=key, Filename=str(tmp_path))
+            s3.download_file(Bucket=bucket, Key=raw_key, Filename=str(tmp_path))
+            # xml file downloaded from S3
             xml_path_to_convert = tmp_path
-            logger.info("Downloaded %s from S3 bucket %s", key, bucket)
+            logger.info("Downloaded s3://%s/%s -> %s", bucket, raw_key, tmp_path)
         except ClientError as e:
-            logger.exception("Error downloading %s from S3: %s", key, 
-                             e.response.get('Error', {}).get('Code'))
-            return {"status": "error", "message": f"Error downloading {key} from S3: "
-                    f"{e.response.get('Error', {}).get('Code')}"}
+            logger.exception("Download error")
+            return {"status": "error", "message": 
+                            f"Error downloading {raw_key}: {e.response.get('Error', {}).get('Code')}"}
     else:
-        # Local mode: file must exist locally
-        logger.info("Running in local mode - using local file system")
-    if merge_xml:
-        logger.info("Merging XML files in %s into one for conversion...", input_dir)
-        date = Path().stat().st_mtime
-        merged_output_path = input_dir / f"merged_input_{date}.xml"
-        merge_xml_files(
-            triggers_dir=input_dir,
-            output_path=merged_output_path
-        )
+        # local mode: key is a filesystem path or just a filename in work_dir
+        local_candidate = Path(key)
+        if not local_candidate.is_absolute():
+            local_candidate = work_dir / local_candidate.name
+        if not local_candidate.exists():
+            logger.error("Local XML file not found: %s", local_candidate)
+            return {"status": "error", "message": f"Local XML file not found: {local_candidate}"}
+        # use local XML file instead
+        xml_path_to_convert = local_candidate
+        logger.info("Using local XML file: %s", xml_path_to_convert)
+
+    # merge XML files if requested (local mode only)
+    if merge_xml and run_mode == "local":
+        merged_output_path = work_dir / f"merged_{int(time.time())}.xml"
+        merge_xml_files(triggers_dir=work_dir, output_path=merged_output_path)
         xml_path_to_convert = merged_output_path
-        logger.info("Finished merging XML files into: %s", merged_output_path)
-    else:
-        xml_path_to_convert = input_dir / Path(key).name
+        logger.info("Merged XML written to: %s", merged_output_path)
     
-    print(f"input_dir: {input_dir}")
-    if not xml_path_to_convert.exists() or not xml_path_to_convert.is_file():
-        logger.error("Local XML file not found: %s", xml_path_to_convert)
-        return {"status": "error", "message": f"Local XML file not found: "
-                f"{xml_path_to_convert}"}
+    logger.debug("Final xml_path_to_convert: %s (exists=%s)", xml_path_to_convert, xml_path_to_convert.exists())
     
-    # Filter XML by IAID in local mode (for quick testing of single records)
+    # IAID filtering (local only)
     filter_iaid = os.getenv("FILTER_IAID")
     if filter_iaid and run_mode == "local":
-        logger.info("FILTER_IAID set: filtering XML for IAID %s", filter_iaid)
-        filtered_xml_path = input_dir / f"filtered_{filter_iaid}.xml"
+        logger.info("Filtering XML for IAID=%s", filter_iaid)
+        filtered_xml_path = work_dir / f"filtered_{filter_iaid}.xml"
         try:
-            xml_path_to_convert = filter_xml_by_iaid(
-                xml_path_to_convert, 
-                filter_iaid, 
-                filtered_xml_path, 
-                logger
-            )
-            logger.info("Using filtered XML: %s", xml_path_to_convert)
+            xml_path_to_convert = filter_xml_by_iaid(xml_path_to_convert, filter_iaid, filtered_xml_path, logger)
+            logger.info("Filtered XML path: %s", xml_path_to_convert)
         except ValueError as e:
             logger.error("Failed to filter XML: %s", e)
             return {"status": "error", "message": str(e)}
     
-    # 3. Convert XML to JSON
+    # 2. Convert XML to JSON
     try:
-        with log_timing(f"XML to JSON conversion ({xml_path_to_convert.name})", logger):
-            records = convert_to_json(xml_path=str(xml_path_to_convert), 
-                                      output_dir=str(output_dir))
+        with log_timing(f"XML->JSON ({xml_path_to_convert.name})", logger):
+            records = convert_to_json(xml_path=str(xml_path_to_convert), output_dir=str(work_dir))
         logger.info("Converted %d records", len(records))
-        
-        # Filter out records that have already been uploaded
         if manifest is not None:
-            original_count = len(records)
+            before = len(records)
             records = filter_new_records(records, manifest, logger)
-            filtered_count = original_count - len(records)
-            if filtered_count > 0:
-                logger.info("Filtered out %d already-uploaded records, %d new records remaining", 
-                           filtered_count, len(records))
-        
-        for f in output_dir.iterdir():
-            logger.debug("  %s", f.name)
+            removed = before - len(records)
+            if removed:
+                logger.info("Dedup removed %d records; %d remain", removed, len(records))
     except Exception:
-        logger.exception("Error converting XML to JSON: %s", xml_path_to_convert)
-        return {"status": "error", "message": f"Error converting XML to JSON for {xml_path_to_convert}"}
+        logger.exception("Conversion failed")
+        return {"status": "error", "message": f"Conversion failed for {xml_path_to_convert.name}"}
     finally:
-        # Clean up temp file if we downloaded from S3
-        if tmp_path and tmp_path.exists():
+        if tmp_path and tmp_path.exists() and run_mode in ["local_s3", "remote_s3"]:
             try:
                 tmp_path.unlink()
             except Exception:
-                logger.exception("Failed to remove temp file %s", tmp_path)
+                logger.warning("Could not remove temp file %s", tmp_path)
 
-    # 4. Load the converted JSON (convert_xml_to_json should have written it)
+    # 3. Load the converted JSON (convert_xml_to_json should have written it)
     converted_xml_to_json_files = records
 
     # save the converted files to disk to investigation if option selected
@@ -238,7 +223,7 @@ def lambda_handler(event, context):
             except Exception as exc:
                 print(f"Error writing transformed json to {output_file}: {exc}")
 
-    # 5. Apply transformations if we have JSON data
+    # 4. Apply transformations if we have JSON data
     if converted_xml_to_json_files:
         successfully_transformed_files = []
         # Collect transformed JSONs by level (in memory)

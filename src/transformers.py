@@ -3,7 +3,7 @@ import copy
 from typing import Any, Optional, Iterable, List, Set
 import xml.etree.ElementTree as ET
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 import re
 import os
 import logging
@@ -104,6 +104,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     records = {}
     print(f"length of root records: {len(list(root.iter('record')))}")
     _total_records = len(list(root.iter('record')))
+    start_time = time.time()
     for i, record in enumerate (root.iter('record')):
         
     ######################## Find_CALM_Record_ID_Element ###########################################################
@@ -877,7 +878,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         
         # update diagnostics
         _records_processed += 1
-        print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
+        estimated_time_remaining = (_total_records - _records_processed) * (time.time() - start_time) / _records_processed
+        print(f"Processed [{i}/{_total_records}]: Estimated time remaining: {estimated_time_remaining/60:.1f} minutes. {_records_processed} / {_total_records} records "
+              f"{(_records_processed/_total_records)*100:.0f}%", end='\r')
         sys.stdout.flush()
 
     print(f"{len(records)} records processed from the XML file.")
