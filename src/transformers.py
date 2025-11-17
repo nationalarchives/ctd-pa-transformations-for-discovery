@@ -96,6 +96,19 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     #for record in root.iter('record'):
 
     ##################################################################################################################
+    # Create dictionary for parentId resolution
+    object_number_dict = {}
+    for record in root.iter('record'):
+        object_number_elem = record.find("object_number")
+        if object_number_elem is not None and object_number_elem.text:
+            object_number = object_number_elem.text
+            
+            # Find the CALM RecordID for this record
+            calm_id_elem = record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
+            if calm_id_elem is not None:
+                alt_number_elem = calm_id_elem.find('alternative_number')
+                if alt_number_elem is not None and alt_number_elem.text:
+                    object_number_dict[object_number] = alt_number_elem.text
 
     # diagnostic counters: how many record nodes processed and unique files written
     _records_processed = 0
@@ -130,17 +143,10 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
         parentId = "A13530124"  # Default value
 
-        for inner_record in root.iter('record'):
-            parent_object_number = inner_record.find("object_number")
-            parent_object_number = parent_object_number.text if parent_object_number is not None else None
-
-            if part_of_reference == parent_object_number:
-                alt_number_node = inner_record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
-                if alt_number_node is not None:
-                    alt_number = alt_number_node.find('alternative_number')
-                if alt_number is not None and alt_number.text:
-                    parentId = alt_number.text
-
+        # Use the lookup dictionary for O(1) parentId resolution
+        if part_of_reference and part_of_reference in object_number_dict:
+            parentId = object_number_dict[part_of_reference]
+            
     #####################################################################################################################
         
         accruals = record.find("accruals")
