@@ -4,6 +4,7 @@ import sys
 import json
 import os
 import logging
+import tempfile
 from pathlib import Path
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
@@ -17,7 +18,7 @@ sys.path.insert(0, str(repo_root))
 
 from src.config_loader import UniversalConfig
 from src.utils import find_key, merge_xml_files, log_timing, _load_json_file, filter_xml_by_iaid
-from src.utils import load_manifest, save_manifest, filter_new_records, update_manifest_with_records
+from src.utils import load_transfer_register, save_transfer_register, filter_new_records, update_transfer_register_with_records
 from src.transformers import NewlineToPTransformer, YNamingTransformer, convert_to_json
 
 
@@ -32,6 +33,9 @@ if not os.getenv("AWS_LAMBDA_FUNCTION_NAME") and not os.getenv("AWS_EXECUTION_EN
 #   - remote_s3: Download/upload to S3 using IAM role (Lambda/AWS execution)
 VALID_RUN_MODES = ["local", "local_s3", "remote_s3"]
 run_mode = os.getenv("RUN_MODE", "remote_s3").strip().lower()
+
+# verbose print statements on progress for long-running batches of records
+VERBOSE_PROGRESS = os.getenv("PROGRESS_VERBOSE", "0").lower() in ("1","true","y")
 
 if run_mode not in VALID_RUN_MODES:
     raise ValueError(
@@ -76,8 +80,8 @@ if run_mode in ["local", "local_s3"]:
 transformations_str = os.environ.get("TRANS_CONFIG")
 transformation_config = _load_json_file(transformations_str, logger=logger)
 
-# Manifest configuration
-manifest_filename = os.getenv("MANIFEST_FILENAME", "uploaded_records_manifest.json")
+# Transfer register configuration (no manifest terminology)
+transfer_register_filename = os.getenv("TRANSFER_REGISTER_FILENAME", "uploaded_records_transfer_register.json")
 
 def lambda_handler(event, context):
     
@@ -92,36 +96,32 @@ def lambda_handler(event, context):
         logger.error("Invalid or missing file key in event: key=%s", key)
         return {"status": "error", "message": "Invalid or missing XML file key in event"}
 
-    # S3 output prefix only (no local dir creation for input)
+    # S3 output prefix (key prefix for uploads). Alias output_dir for legacy variable usage below.
     output_prefix = os.environ.get('S3_OUTPUT_DIR', 'json_outputs').strip().strip('/')
-
-    # Validate key exists and is an XML file
-    if not key or not key.endswith(".xml"):
-        logger.error("Invalid or missing file key in event: key=%s", key)
-        return {"status": "error", "message": "Invalid or missing XML file key in event"}
+    output_dir = output_prefix  # backward compatibility for existing code paths
     
-    # Load manifest for deduplication (only in S3 modes)
-    manifest = None
+    # Load transfer register for deduplication (only in S3 modes)
+    transfer_register = None
     if run_mode in ["local_s3", "remote_s3"]:
-        if not manifest_filename:
-            logger.error("MANIFEST_FILENAME environment variable is not set")
+        if not transfer_register_filename:
+            logger.error("TRANSFER_REGISTER_FILENAME environment variable is not set")
             return {
                 "status": "error",
-                "message": "MANIFEST_FILENAME environment variable is required"
+                "message": "TRANSFER_REGISTER_FILENAME environment variable is required"
             }
         try:
-            manifest = load_manifest(manifest_filename, s3, bucket, output_prefix, logger)
-            num_existing = len(manifest.get('records', {}))
-            logger.info("Loaded manifest with %d existing records", num_existing)
+            transfer_register = load_transfer_register(transfer_register_filename, s3, bucket, output_prefix, logger)
+            num_existing = len(transfer_register.get('records', {}))
+            logger.info("Loaded transfer register with %d existing records", num_existing)
         except Exception as e:
-            logger.exception("FATAL: Failed to load manifest - cannot proceed without deduplication")
+            logger.exception("FATAL: Failed to load transfer register - cannot proceed without deduplication")
             return {
                 "status": "error",
-                "message": f"Failed to load deduplication manifest: {str(e)}"
+                "message": f"Failed to load deduplication transfer register: {str(e)}"
             }
     else:
-        manifest = None
-        logger.info("Running in local mode - skipping manifest/deduplication")
+        transfer_register = None
+        logger.info("Running in local mode - skipping transfer register/deduplication")
 
     # we can view any transformation intermediates in this dir (not in AWS Lambda)
     intermediate_dir = Path(os.environ.get('CTD_DATA_INTERMEDIATE', ''))
@@ -134,10 +134,11 @@ def lambda_handler(event, context):
     
     # whether to merge XML files from folder structure before processing
     _merge_env = os.getenv("MERGE_XML", "false")
-    merge_xml = merge_xml = _merge_env.strip().lower() in truthy_chars
+    merge_xml = _merge_env.strip().lower() in truthy_chars
 
-    # Work directory for temp files downloaded from S3
-    work_dir = Path("/tmp")
+    # Portable work directory for temp/intermediate files
+    work_dir = Path(tempfile.gettempdir())
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     # set other paths to None initially
     xml_path_to_convert = None
@@ -145,21 +146,30 @@ def lambda_handler(event, context):
 
     # Download from S3 in S3 modes (local_s3 or remote_s3)
     if run_mode in ["local_s3", "remote_s3"]:
-        tmp_path = work_dir / f"{Path(raw_key).name}"
+        tmp_path = work_dir / Path(raw_key).name
+        logger.info("Downloading s3://%s/%s -> %s", bucket, raw_key, tmp_path)
         try:
-            s3.download_file(Bucket=bucket, Key=raw_key, Filename=str(tmp_path))
-            # xml file downloaded from S3
-            xml_path_to_convert = tmp_path
-            logger.info("Downloaded s3://%s/%s -> %s", bucket, raw_key, tmp_path)
+            s3.download_file(bucket, raw_key, str(tmp_path))
         except ClientError as e:
-            logger.exception("Download error")
-            return {"status": "error", "message": 
-                            f"Error downloading {raw_key}: {e.response.get('Error', {}).get('Code')}"}
+            err = e.response.get('Error', {})
+            code = err.get('Code')
+            if code in ("404", "NoSuchKey"):
+                logger.error("S3 key not found: s3://%s/%s", bucket, raw_key)
+                return {"status": "error", "message": f"S3 key not found: s3://{bucket}/{raw_key}"}
+            return {"status": "error", "message": f"S3 download failed ({code}) for {raw_key}"}
+        except Exception as e:
+            logger.exception("Unexpected S3 download error")
+            return {"status": "error", "message": f"Unexpected download error for {raw_key}: {e}"}
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            logger.error("Downloaded file missing or empty: %s", tmp_path)
+            return {"status": "error", "message": f"Downloaded file missing or empty: {tmp_path}"}
+        xml_path_to_convert = tmp_path
+        logger.info("Downloaded OK (%d bytes)", tmp_path.stat().st_size)
     else:
-        # local mode: key is a filesystem path or just a filename in work_dir
+        # local mode: resolve path relative to repo root if not absolute
         local_candidate = Path(key)
         if not local_candidate.is_absolute():
-            local_candidate = work_dir / local_candidate.name
+            local_candidate = repo_root / key
         if not local_candidate.exists():
             logger.error("Local XML file not found: %s", local_candidate)
             return {"status": "error", "message": f"Local XML file not found: {local_candidate}"}
@@ -191,11 +201,12 @@ def lambda_handler(event, context):
     # 2. Convert XML to JSON
     try:
         with log_timing(f"XML->JSON ({xml_path_to_convert.name})", logger):
-            records = convert_to_json(xml_path=str(xml_path_to_convert), output_dir=str(work_dir))
+            records = convert_to_json(xml_path=str(xml_path_to_convert), output_dir=str(work_dir),
+                                      progress_verbose=VERBOSE_PROGRESS)
         logger.info("Converted %d records", len(records))
-        if manifest is not None:
+        if transfer_register is not None:
             before = len(records)
-            records = filter_new_records(records, manifest, logger)
+            records = filter_new_records(records, transfer_register, logger)
             removed = before - len(records)
             if removed:
                 logger.info("Dedup removed %d records; %d remain", removed, len(records))
@@ -310,9 +321,10 @@ def lambda_handler(event, context):
                 try:
                     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
                         for filename, json_data in files:
+                            safe_name = f"{Path(filename).name}.json"
                             json_bytes = json.dumps(json_data, ensure_ascii=False, 
                                                     indent=2).encode("utf-8")
-                            ti = tarfile.TarInfo(name=f"{filename}.json")
+                            ti = tarfile.TarInfo(name=safe_name)
                             ti.size = len(json_bytes)
                             ti.mtime = int(time.time())
                             tar.addfile(ti, fileobj=io.BytesIO(json_bytes))
@@ -366,20 +378,20 @@ def lambda_handler(event, context):
                             super_tarball_name, len(super_tar_bytes))
                 
                 # Upload to json_outputs folder in S3
-                tar_key = f"{output_dir}/{super_tarball_name}"
+                tar_key = f"{output_prefix}/{super_tarball_name}"
                 try:
                     s3.put_object(Bucket=bucket, Key=tar_key, Body=super_tar_bytes)
                     logger.info("Uploaded tarball to s3://%s/%s", bucket, tar_key)
                     
-                    # Update manifest with newly uploaded records
-                    if manifest is not None:
-                        manifest = update_manifest_with_records(manifest, converted_xml_to_json_files, 
-                                                                key, bucket, output_dir, logger)
+                    # Update transfer register with newly uploaded records
+                    if transfer_register is not None:
+                        transfer_register = update_transfer_register_with_records(transfer_register, converted_xml_to_json_files,
+                                                                                   key, bucket, output_prefix, logger)
                         try:
-                            save_manifest(manifest_filename, s3, bucket, output_dir, manifest, logger)
-                            logger.info("Updated manifest with %d total records", len(manifest.get('records', {})))
+                            save_transfer_register(transfer_register_filename, s3, bucket, output_prefix, transfer_register, logger)
+                            logger.info("Updated transfer register with %d total records", len(transfer_register.get('records', {})))
                         except Exception:
-                            logger.exception("Error saving manifest (non-fatal)")
+                            logger.exception("Error saving transfer register (non-fatal)")
                             
                 except ClientError as e:
                     logger.exception("Error uploading tarball to S3: %s", 

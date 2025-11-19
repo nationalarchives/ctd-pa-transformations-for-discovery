@@ -4,13 +4,17 @@ from typing import Any, Optional, Iterable, List, Set
 import xml.etree.ElementTree as ET
 import json
 from datetime import datetime, time, timedelta
+import time as pytime
 import re
 import os
 import logging
 import sys
 
+from utils import progress_context, _fmt_duration
 
-def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = True):
+
+def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = True, 
+                    progress_verbose: bool = False):
     # this function relies on module-level `tree` and `root` set by the caller
     # (the main runner sets these globals before calling convert_to_json)
     global tree, root
@@ -104,259 +108,323 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     records = {}
     print(f"length of root records: {len(list(root.iter('record')))}")
     _total_records = len(list(root.iter('record')))
-    start_time = time.time()
-    for i, record in enumerate (root.iter('record')):
-        
-    ######################## Find_CALM_Record_ID_Element ###########################################################
-        
-        Find_CALM_Record_ID_Element = record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
-        if Find_CALM_Record_ID_Element is not None:
-            iaid = Find_CALM_Record_ID_Element.find('alternative_number').text
-        else:
-            iaid = None
-
-    ###############################################################################################################
-        
-        #replicaId -- not used
-        
-        citableReference = record.find("object_number")
-        citableReference = citableReference.text if citableReference is not None else None
-    
-        #accumulationDates #-- not used
-
-    #################################### parentId ####################################################################
-
-        part_of_reference = record.find("Part_of/part_of_reference")
-        part_of_reference = part_of_reference.text if part_of_reference is not None else None
-
-        parentId = "A13530124"  # Default value
-
-        for inner_record in root.iter('record'):
-            parent_object_number = inner_record.find("object_number")
-            parent_object_number = parent_object_number.text if parent_object_number is not None else None
-
-            if part_of_reference == parent_object_number:
-                alt_number_node = inner_record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
-                if alt_number_node is not None:
-                    alt_number = alt_number_node.find('alternative_number')
-                if alt_number is not None and alt_number.text:
-                    parentId = alt_number.text
-
-    #####################################################################################################################
-        
-        accruals = record.find("accruals")
-        accruals = accruals.text if accruals is not None else None
-        
-        #accessConditions = record.find("access_category.notes") #should apply only to level 1-8    # not used in this form anymore anymore
-        #accessConditions =  accessConditions.text if accessConditions is not None else None
-        
-        administrativeBackground = record.find("admin_history")
-        administrativeBackground = administrativeBackground.text if administrativeBackground is not None else None
-        
-        #appraisalInformation = record.find("disposal.notes")                                        # not used used anymore
-        #appraisalInformation = appraisalInformation.text if appraisalInformation is not None else None
-
-    ############################# arrangement###########################################################################
+    # track start time for average rate computation
+    loop_start = pytime.time()
+    with progress_context(total=_total_records, interval=100, label="xml->json") as tick:
+        for i, record in enumerate (root.iter('record')):
             
-        arrangement_system = record.find("system_of_arrangement") #values of system_of_arrangement and client_filepath need to be aggregted in arrangement JSON field
-        arrangement_system = arrangement_system.text if arrangement_system is not None else ''
-        client_filepath = record.find("client_filepath")
-        client_filepath = client_filepath.text if client_filepath is not None else ''
-
-        arrangement = arrangement_system+' '+client_filepath
-        arrangement = arrangement.strip()
-        
-        if arrangement == "":
-            arrangement = None
-
-    #####################################################################################################################
-
-        #batchId ---> not used
-        
-        #refIaid ---> not used 
-        
-        catalogueId = record.find("catid")
-        catalogueId = int(catalogueId.text) if catalogueId is not None else None
-
-    ############ catalogueLevel and access condition #############################################################################
-        
-        catalogueLevel = record.find("record_type/value[@lang='neutral']")
-        catalogueLevel = catalogueLevel.text if catalogueLevel is not None else None
-        if catalogueLevel is not None:
-            catalogueLevel = int(catalogueLevel)
-
-        if catalogueLevel >= 9: 
-            accessConditions =  None
-
-        if catalogueLevel <= 8: 
-            accessConditions =  "Open unless otherwise stated"
-
-    #######################################################################################################
-    
-        coveringFromDate = record.find("Dating/dating.date.start")
-        coveringFromDate = coveringFromDate.text if coveringFromDate is not None else None
-        if coveringFromDate is not None:
-            coveringFromDate = int(coveringFromDate)
-        
-        coveringToDate = record.find("Dating/dating.date.end")
-        coveringToDate = coveringToDate.text if coveringToDate is not None else None
-        if coveringToDate is not None:
-            coveringToDate = int(coveringToDate)
-        
-        chargeType = 1
-        
-        # eDocumentId -- not used
-        
-        coveringDates = record.find("dating.notes")
-        coveringDates = coveringDates.text if coveringDates is not None else None
-        
-        custodialHistory = record.find("object_history_note")
-        custodialHistory = custodialHistory.text if custodialHistory is not None else None
-
-    ################### heldBy #######################################################
-        
-        heldBy_information = record.find("institution.name")
-        heldBy_information = heldBy_information.text if heldBy_information is not None else None
-
-        heldBy = []
-        
-        if heldBy_information == "The National Archives, Kew":
-            heldBy = [
-        {
-        "xReferenceId": "A13530124",
-        "xReferenceCode": "66",
-        "xReferenceName": "The National Archives, Kew"
-        }
-    ]
-        elif heldBy_information == "UK Parliament":
-            heldBy = [
-        {
-        "xReferenceId": "A13531051",
-        "xReferenceCode": "61",
-        "xReferenceName": "UK Parliament"
-        }
-    ]
-
-        elif heldBy_information == "British Film Institute":
-            heldBy = [
-        {
-        "xReferenceId": "A13532152",
-        "xReferenceCode": "2870",
-        "xReferenceName": "British Film Institute (BFI) National Archive"
-        }
-    ]
-    
-    ######### ClosureCode ClosureStatus and closure Type ##################################
-
-        if catalogueLevel >= 9:
-            closureStatus = record.find("access_status/value[@lang='neutral']")
-            closureStatus = closureStatus.text if closureStatus is not None else None
-        
-            if closureStatus == 'OPEN':
-                closureStatus = 'O'
-            elif closureStatus == 'CLOSED':
-                closureStatus = 'D'
-
-            closureCode = record.find("closed_until")
-            if closureStatus == 'D':
-                closureCode = closureCode.text
-                closureCode = datetime.strptime(closureCode, "%Y-%m-%d")
-                closureCode = closureCode.strftime("%Y")
+        ######################## Find_CALM_Record_ID_Element ###########################################################
+            
+            Find_CALM_Record_ID_Element = record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
+            if Find_CALM_Record_ID_Element is not None:
+                iaid = Find_CALM_Record_ID_Element.find('alternative_number').text
             else:
+                iaid = None
+
+        ###############################################################################################################
+            
+            #replicaId -- not used
+            
+            citableReference = record.find("object_number")
+            citableReference = citableReference.text if citableReference is not None else None
+        
+            #accumulationDates #-- not used
+
+        #################################### parentId ####################################################################
+
+            part_of_reference = record.find("Part_of/part_of_reference")
+            part_of_reference = part_of_reference.text if part_of_reference is not None else None
+
+            parentId = "A13530124"  # Default value
+
+            for inner_record in root.iter('record'):
+                parent_object_number = inner_record.find("object_number")
+                parent_object_number = parent_object_number.text if parent_object_number is not None else None
+
+                if part_of_reference == parent_object_number:
+                    alt_number_node = inner_record.find("Alternative_number/[alternative_number.type='CALM RecordID']")
+                    if alt_number_node is not None:
+                        alt_number = alt_number_node.find('alternative_number')
+                    if alt_number is not None and alt_number.text:
+                        parentId = alt_number.text
+
+        #####################################################################################################################
+            
+            accruals = record.find("accruals")
+            accruals = accruals.text if accruals is not None else None
+            
+            #accessConditions = record.find("access_category.notes") #should apply only to level 1-8    # not used in this form anymore anymore
+            #accessConditions =  accessConditions.text if accessConditions is not None else None
+            
+            administrativeBackground = record.find("admin_history")
+            administrativeBackground = administrativeBackground.text if administrativeBackground is not None else None
+            
+            #appraisalInformation = record.find("disposal.notes")                                        # not used used anymore
+            #appraisalInformation = appraisalInformation.text if appraisalInformation is not None else None
+
+        ############################# arrangement###########################################################################
+                
+            arrangement_system = record.find("system_of_arrangement") #values of system_of_arrangement and client_filepath need to be aggregted in arrangement JSON field
+            arrangement_system = arrangement_system.text if arrangement_system is not None else ''
+            client_filepath = record.find("client_filepath")
+            client_filepath = client_filepath.text if client_filepath is not None else ''
+
+            arrangement = arrangement_system+' '+client_filepath
+            arrangement = arrangement.strip()
+            
+            if arrangement == "":
+                arrangement = None
+
+        #####################################################################################################################
+
+            #batchId ---> not used
+            
+            #refIaid ---> not used 
+            
+            catalogueId = record.find("catid")
+            catalogueId = int(catalogueId.text) if catalogueId is not None else None
+
+        ############ catalogueLevel and access condition #############################################################################
+            
+            catalogueLevel = record.find("record_type/value[@lang='neutral']")
+            catalogueLevel = catalogueLevel.text if catalogueLevel is not None else None
+            if catalogueLevel is not None:
+                catalogueLevel = int(catalogueLevel)
+
+            if catalogueLevel >= 9: 
+                accessConditions =  None
+
+            if catalogueLevel <= 8: 
+                accessConditions =  "Open unless otherwise stated"
+
+        #######################################################################################################
+        
+            coveringFromDate = record.find("Dating/dating.date.start")
+            coveringFromDate = coveringFromDate.text if coveringFromDate is not None else None
+            if coveringFromDate is not None:
+                coveringFromDate = int(coveringFromDate)
+            
+            coveringToDate = record.find("Dating/dating.date.end")
+            coveringToDate = coveringToDate.text if coveringToDate is not None else None
+            if coveringToDate is not None:
+                coveringToDate = int(coveringToDate)
+            
+            chargeType = 1
+            
+            # eDocumentId -- not used
+            
+            coveringDates = record.find("dating.notes")
+            coveringDates = coveringDates.text if coveringDates is not None else None
+            
+            custodialHistory = record.find("object_history_note")
+            custodialHistory = custodialHistory.text if custodialHistory is not None else None
+
+        ################### heldBy #######################################################
+            
+            heldBy_information = record.find("institution.name")
+            heldBy_information = heldBy_information.text if heldBy_information is not None else None
+
+            heldBy = []
+            
+            if heldBy_information == "The National Archives, Kew":
+                heldBy = [
+            {
+            "xReferenceId": "A13530124",
+            "xReferenceCode": "66",
+            "xReferenceName": "The National Archives, Kew"
+            }
+        ]
+            elif heldBy_information == "UK Parliament":
+                heldBy = [
+            {
+            "xReferenceId": "A13531051",
+            "xReferenceCode": "61",
+            "xReferenceName": "UK Parliament"
+            }
+        ]
+
+            elif heldBy_information == "British Film Institute":
+                heldBy = [
+            {
+            "xReferenceId": "A13532152",
+            "xReferenceCode": "2870",
+            "xReferenceName": "British Film Institute (BFI) National Archive"
+            }
+        ]
+        
+        ######### ClosureCode ClosureStatus and closure Type ##################################
+
+            if catalogueLevel >= 9:
+                closureStatus = record.find("access_status/value[@lang='neutral']")
+                closureStatus = closureStatus.text if closureStatus is not None else None
+            
+                if closureStatus == 'OPEN':
+                    closureStatus = 'O'
+                elif closureStatus == 'CLOSED':
+                    closureStatus = 'D'
+
+                closureCode = record.find("closed_until")
+                if closureStatus == 'D':
+                    closureCode = closureCode.text
+                    closureCode = datetime.strptime(closureCode, "%Y-%m-%d")
+                    closureCode = closureCode.strftime("%Y")
+                else:
+                    closureCode = None
+
+                closureType = None
+                
+                if closureStatus == 'D':
+                    closureType = 'U'
+                else:
+                    closureType = None
+
+                if closureStatus == 'D' and heldBy_information == "UK Parliament":
+                    closureStatus = 'U'
+                    closureCode = None
+                    closureType = None
+
+            if catalogueLevel <= 8:
+                closureStatus = None
                 closureCode = None
-
-            closureType = None
-            
-            if closureStatus == 'D':
-                closureType = 'U'
-            else:
                 closureType = None
 
-            if closureStatus == 'D' and heldBy_information == "UK Parliament":
-                closureStatus = 'U'
-                closureCode = None
-                closureType = None
 
-        if catalogueLevel <= 8:
-            closureStatus = None
-            closureCode = None
-            closureType = None
+        ################### recordOpeningDate #######################################################
 
+            if catalogueLevel >= 9:
+                
+                recordOpeningDate = record.find("closed_until") 
+                recordOpeningDate = recordOpeningDate.text if recordOpeningDate is not None else None
 
-    ################### recordOpeningDate #######################################################
-
-        if catalogueLevel >= 9:
-            
-            recordOpeningDate = record.find("closed_until") 
-            recordOpeningDate = recordOpeningDate.text if recordOpeningDate is not None else None
-
-            if record.find("access_status/value[@lang='neutral']").text == 'CLOSED' and heldBy_information == "UK Parliament":
+                if record.find("access_status/value[@lang='neutral']").text == 'CLOSED' and heldBy_information == "UK Parliament":
+                    recordOpeningDate = None
+                    
+            if catalogueLevel <= 8:
                 recordOpeningDate = None
                 
-        if catalogueLevel <= 8:
-            recordOpeningDate = None
+        #    if recordOpeningDate is not None:
+        #        closed_date_object = datetime.strptime(recordOpeningDate, "%Y-%m-%d")
+        #        recordOpeningDate = closed_date_object + timedelta(days =1)
+        #        #recordOpeningDate = recordOpeningDate.strftime("%Y-%m-%d")
+        #        recordOpeningDate = recordOpeningDate.strftime("%d-%m-%Y")
             
-    #    if recordOpeningDate is not None:
-    #        closed_date_object = datetime.strptime(recordOpeningDate, "%Y-%m-%d")
-    #        recordOpeningDate = closed_date_object + timedelta(days =1)
-    #        #recordOpeningDate = recordOpeningDate.strftime("%Y-%m-%d")
-    #        recordOpeningDate = recordOpeningDate.strftime("%d-%m-%Y")
-        
-    #    else:
-    #        recordOpeningDate = None
-    #############################################################################################
-        
-        # corporateNames -- not used
-
-    ################### copiesInformation #######################################################
-
-        copiesInformation_description = record.find("existence_of_copies")
-        copiesInformation_description = copiesInformation_description.text if copiesInformation_description is not None else None
-
-        copiesInformation = []
-        if copiesInformation_description is not None:
-            copiesInformation = [
-        {
-        "xReferenceName": None,
-        "xReferenceDescription": None,
-        "description": copiesInformation_description
-        }
-    ]
-        else:
-            copiesInformation = [
-        {
-        "xReferenceName": None,
-        "xReferenceDescription": None,
-        "description": None
-        }
-    ]
-    ################### creatorName #######################################################
-
-        if catalogueLevel >= 9:
+        #    else:
+        #        recordOpeningDate = None
+        #############################################################################################
             
-            creatorName = [
+            # corporateNames -- not used
+
+        ################### copiesInformation #######################################################
+
+            copiesInformation_description = record.find("existence_of_copies")
+            copiesInformation_description = copiesInformation_description.text if copiesInformation_description is not None else None
+
+            copiesInformation = []
+            if copiesInformation_description is not None:
+                copiesInformation = [
             {
             "xReferenceName": None,
-            "preTitle": None,
-            "title": None,
-            "firstName": None,
-            "surname": None,
-            "startDate": 0,
-            "endDate": 0
+            "xReferenceDescription": None,
+            "description": copiesInformation_description
             }
         ]
-
-
-        if catalogueLevel <= 8:
-
-            creatorName_xReferenceName = record.find("Production//creator")
-            creatorName_xReferenceName = creatorName_xReferenceName.text if creatorName_xReferenceName is not None else None
-
-            creatorName = []
-            if creatorName_xReferenceName is not None:
-                creatorName = [
+            else:
+                copiesInformation = [
             {
-            "xReferenceName": creatorName_xReferenceName,
+            "xReferenceName": None,
+            "xReferenceDescription": None,
+            "description": None
+            }
+        ]
+        ################### creatorName #######################################################
+
+            if catalogueLevel >= 9:
+                
+                creatorName = [
+                {
+                "xReferenceName": None,
+                "preTitle": None,
+                "title": None,
+                "firstName": None,
+                "surname": None,
+                "startDate": 0,
+                "endDate": 0
+                }
+            ]
+
+
+            if catalogueLevel <= 8:
+
+                creatorName_xReferenceName = record.find("Production//creator")
+                creatorName_xReferenceName = creatorName_xReferenceName.text if creatorName_xReferenceName is not None else None
+
+                creatorName = []
+                if creatorName_xReferenceName is not None:
+                    creatorName = [
+                {
+                "xReferenceName": creatorName_xReferenceName,
+                "preTitle": None,
+                "title": None,
+                "firstName": None,
+                "surname": None,
+                "startDate": 0,
+                "endDate": 0
+                }
+            ]
+                else:
+                    creatorName = [
+                {
+                "xReferenceName": None,
+                "preTitle": None,
+                "title": None,
+                "firstName": None,
+                "surname": None,
+                "startDate": 0,
+                "endDate": 0
+                }
+            ]
+                
+        ############################ digitised ##########################################################
+
+            digitised = record.find("digitised")
+            digitised = digitised.text if digitised is not None else None
+            if digitised is None:
+                digitised = False
+            if digitised == "x":
+                digitised = True
+
+        #################################################################################################
+
+            #dimensions -- not used
+            
+        ########################### formerReferenceDep ###################################################
+            
+            Find_Former_Ref_Department_Element = record.find("Alternative_number/[alternative_number.type='Former reference (Department)']")
+            if Find_Former_Ref_Department_Element is not None:
+                formerReferenceDep = Find_Former_Ref_Department_Element.find('alternative_number').text
+            else:
+                formerReferenceDep = None
+
+        ########################### formerReferencePro #########################################
+        
+            Find_Former_Archival_Ref_Element = record.find("Alternative_number/[alternative_number.type='Former archival reference']")
+            if Find_Former_Archival_Ref_Element is not None:
+                formerReferencePro = Find_Former_Archival_Ref_Element.find('alternative_number').text
+            else:
+                formerReferencePro = None
+            
+        ################################# immediateSourceOfAcquisition #######################################
+
+            immediateSourceOfAcquisition_xReferenceDescription = record.find("acquisition.notes")
+            immediateSourceOfAcquisition_xReferenceDescription =  immediateSourceOfAcquisition_xReferenceDescription.text if immediateSourceOfAcquisition_xReferenceDescription is not None else None
+
+            immediateSourceOfAcquisition = []
+
+            if immediateSourceOfAcquisition_xReferenceDescription is not None:
+                immediateSourceOfAcquisition = [
+            {
+            "xReferenceName": None,
+            "xReferenceDescription": immediateSourceOfAcquisition_xReferenceDescription,
             "preTitle": None,
             "title": None,
             "firstName": None,
@@ -366,9 +434,10 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
             }
         ]
             else:
-                creatorName = [
+                immediateSourceOfAcquisition = [
             {
             "xReferenceName": None,
+            "xReferenceDescription": None,
             "preTitle": None,
             "title": None,
             "firstName": None,
@@ -378,513 +447,462 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
             }
         ]
             
-    ############################ digitised ##########################################################
+        #############################################################################################
 
-        digitised = record.find("digitised")
-        digitised = digitised.text if digitised is not None else None
-        if digitised is None:
-            digitised = False
-        if digitised == "x":
-            digitised = True
+            language = record.find("Inscription//inscription.language")
+            language = language.text if language is not None else None
 
-    #################################################################################################
+            legalStatus = record.find("legal_status/value[@lang='0']")
+            legalStatus = legalStatus.text if legalStatus is not None else None
 
-        #dimensions -- not used
-        
-    ########################### formerReferenceDep ###################################################
-        
-        Find_Former_Ref_Department_Element = record.find("Alternative_number/[alternative_number.type='Former reference (Department)']")
-        if Find_Former_Ref_Department_Element is not None:
-            formerReferenceDep = Find_Former_Ref_Department_Element.find('alternative_number').text
-        else:
-            formerReferenceDep = None
+            #links -- not used
+            
+        ################################# existence_of_originals #######################################
 
-    ########################### formerReferencePro #########################################
-    
-        Find_Former_Archival_Ref_Element = record.find("Alternative_number/[alternative_number.type='Former archival reference']")
-        if Find_Former_Archival_Ref_Element is not None:
-            formerReferencePro = Find_Former_Archival_Ref_Element.find('alternative_number').text
-        else:
-            formerReferencePro = None
-        
-    ################################# immediateSourceOfAcquisition #######################################
+            locationOfOriginals_xReferenceDescription = record.find("existence_of_originals")
+            locationOfOriginals_xReferenceDescription = locationOfOriginals_xReferenceDescription.text if locationOfOriginals_xReferenceDescription is not None else None
 
-        immediateSourceOfAcquisition_xReferenceDescription = record.find("acquisition.notes")
-        immediateSourceOfAcquisition_xReferenceDescription =  immediateSourceOfAcquisition_xReferenceDescription.text if immediateSourceOfAcquisition_xReferenceDescription is not None else None
+            locationOfOriginals = []
 
-        immediateSourceOfAcquisition = []
-
-        if immediateSourceOfAcquisition_xReferenceDescription is not None:
-            immediateSourceOfAcquisition = [
-        {
-        "xReferenceName": None,
-        "xReferenceDescription": immediateSourceOfAcquisition_xReferenceDescription,
-        "preTitle": None,
-        "title": None,
-        "firstName": None,
-        "surname": None,
-        "startDate": 0,
-        "endDate": 0
-        }
-    ]
-        else:
-            immediateSourceOfAcquisition = [
-        {
-        "xReferenceName": None,
-        "xReferenceDescription": None,
-        "preTitle": None,
-        "title": None,
-        "firstName": None,
-        "surname": None,
-        "startDate": 0,
-        "endDate": 0
-        }
-    ]
-        
-    #############################################################################################
-
-        language = record.find("Inscription//inscription.language")
-        language = language.text if language is not None else None
-
-        legalStatus = record.find("legal_status/value[@lang='0']")
-        legalStatus = legalStatus.text if legalStatus is not None else None
-
-        #links -- not used
-        
-    ################################# existence_of_originals #######################################
-
-        locationOfOriginals_xReferenceDescription = record.find("existence_of_originals")
-        locationOfOriginals_xReferenceDescription = locationOfOriginals_xReferenceDescription.text if locationOfOriginals_xReferenceDescription is not None else None
-
-        locationOfOriginals = []
-
-        if locationOfOriginals_xReferenceDescription is not None:
-            locationOfOriginals = [
+            if locationOfOriginals_xReferenceDescription is not None:
+                locationOfOriginals = [
+                {
+                "xReferenceName": None,
+                "xReferenceDescription": locationOfOriginals_xReferenceDescription
+                }
+        ]
+            else:
+                locationOfOriginals = [
             {
             "xReferenceName": None,
-            "xReferenceDescription": locationOfOriginals_xReferenceDescription
+            "xReferenceDescription": None
             }
-    ]
-        else:
-            locationOfOriginals = [
-        {
-        "xReferenceName": None,
-        "xReferenceDescription": None
-        }
-    ]
-
-    ######################################################################################################################################################################
-
-        # "mapDesignation" -- not used
-        # "mapScaleNumber" -- not used
-        # note -- not used
-
-    ################################# people - NOT USED #######################################
-        
-
-        
-    #    people  = []
-    #    people =  [
-    #    {
-    #      "preTitle": None,
-    #      "title": None,
-    #      "forenames": [
-    #       None
-    #      ],
-    #      "surname": None,
-    #      "dateOfBirth": None,
-    #      "dateOfDeath": None
-    #    }
-    #  ]
-
-    ######################################## physicalDescriptionExtent and physicalDescriptionForm ########################################################################################################
-
-
-        extent_descriptions = []
-
-        for extent in record.findall('Extent'):
-            value_elem = extent.find("extent.value")
-            form_elem = extent.find("extent.form")
-
-            value_text = value_elem.text.strip() if value_elem is not None and value_elem.text else ""
-            form_text = form_elem.text.strip() if form_elem is not None and form_elem.text else ""
-
-            if value_text or form_text:
-                extent_descriptions.append((value_text, form_text))
-
-        physicalDescriptionExtent = extent_descriptions[0][0] if extent_descriptions else None
-
-        physicalDescriptionForm = []
-        if extent_descriptions:
-            first_form = extent_descriptions[0][1]
-            if first_form:
-                physicalDescriptionForm.append(f" {first_form}")
-            for value, form in extent_descriptions[1:]:
-                physicalDescriptionForm.append(f"{value} {form}".strip())
-
-        physicalDescriptionForm = '; '.join(physicalDescriptionForm) if physicalDescriptionForm else None
-
-    ################################# places - NOT USED #############################################################################################
-        
-        
-    #    places  = []
-    #    places = [
-    #    {
-    #      "description": None,
-    #      "placeName": None,
-    #      "parish": None,
-    #      "town": None,
-    #      "county": None,
-    #      "country": None
-    #    }
-    #  ]
-
-    ################################ referencePart ###########################################################
-
-        referencePart = record.find("object_number")
-        referencePart = referencePart.text if referencePart is not None else None
-
-        referencePart_pattern = r"([^\/]+$)"
-        referencePart_pattern_match = re.search(referencePart_pattern, referencePart)
-        referencePart = referencePart_pattern_match.group()
-
-    ################################ publicationNote ###########################################################
-
-        publicationNote_string = record.find("publication_note")
-        publicationNote_string = publicationNote_string.text if publicationNote_string is not None else None
-
-        if publicationNote_string is not None:
-            publicationNote = []
-            publicationNote = [
-            publicationNote_string
-        ]
-            
-        elif publicationNote_string is None:
-            publicationNote = []
-            publicationNote = [
-            None
         ]
 
-    ################################ publicationNote ###########################################################
+        ######################################################################################################################################################################
+
+            # "mapDesignation" -- not used
+            # "mapScaleNumber" -- not used
+            # note -- not used
+
+        ################################# people - NOT USED #######################################
+            
+
+            
+        #    people  = []
+        #    people =  [
+        #    {
+        #      "preTitle": None,
+        #      "title": None,
+        #      "forenames": [
+        #       None
+        #      ],
+        #      "surname": None,
+        #      "dateOfBirth": None,
+        #      "dateOfDeath": None
+        #    }
+        #  ]
+
+        ######################################## physicalDescriptionExtent and physicalDescriptionForm ########################################################################################################
+
+
+            extent_descriptions = []
+
+            for extent in record.findall('Extent'):
+                value_elem = extent.find("extent.value")
+                form_elem = extent.find("extent.form")
+
+                value_text = value_elem.text.strip() if value_elem is not None and value_elem.text else ""
+                form_text = form_elem.text.strip() if form_elem is not None and form_elem.text else ""
+
+                if value_text or form_text:
+                    extent_descriptions.append((value_text, form_text))
+
+            physicalDescriptionExtent = extent_descriptions[0][0] if extent_descriptions else None
+
+            physicalDescriptionForm = []
+            if extent_descriptions:
+                first_form = extent_descriptions[0][1]
+                if first_form:
+                    physicalDescriptionForm.append(f" {first_form}")
+                for value, form in extent_descriptions[1:]:
+                    physicalDescriptionForm.append(f"{value} {form}".strip())
+
+            physicalDescriptionForm = '; '.join(physicalDescriptionForm) if physicalDescriptionForm else None
+
+        ################################# places - NOT USED #############################################################################################
             
             
-        relatedMaterial_description = record.find("related_material.free_text")
-        relatedMaterial_description = relatedMaterial_description.text if relatedMaterial_description is not None else None
+        #    places  = []
+        #    places = [
+        #    {
+        #      "description": None,
+        #      "placeName": None,
+        #      "parish": None,
+        #      "town": None,
+        #      "county": None,
+        #      "country": None
+        #    }
+        #  ]
 
-        if relatedMaterial_description is not None:
-            relatedMaterial = []
-            relatedMaterial = [
-        {
-        "xReferenceId": None,
-        "description":  relatedMaterial_description
-        }
-    ]
-        elif relatedMaterial_description is None:
-            relatedMaterial = []
-            relatedMaterial = [
-        {
-        "xReferenceId": None,
-        "description":  None
-        }
-    ]
+        ################################ referencePart ###########################################################
 
-    ################################# separatedMaterial ##############################################################
+            referencePart = record.find("object_number")
+            referencePart = referencePart.text if referencePart is not None else None
 
-        separatedMaterial = []
-        separatedMaterial = [
-        {
-        "xReferenceId": None,
-        "description": None
-        }
-    ]
+            referencePart_pattern = r"([^\/]+$)"
+            referencePart_pattern_match = re.search(referencePart_pattern, referencePart)
+            referencePart = referencePart_pattern_match.group()
 
-    ###################################################################################################################
+        ################################ publicationNote ###########################################################
 
-        
-        #registryRecords -- not used and not in JSON template
-        
-        #restrictionsOnUse = record.find("copyright_note")
-        #restrictionsOnUse = restrictionsOnUse.text if restrictionsOnUse is not None else None
+            publicationNote_string = record.find("publication_note")
+            publicationNote_string = publicationNote_string.text if publicationNote_string is not None else None
 
+            if publicationNote_string is not None:
+                publicationNote = []
+                publicationNote = [
+                publicationNote_string
+            ]
+                
+            elif publicationNote_string is None:
+                publicationNote = []
+                publicationNote = [
+                None
+            ]
 
-    ##################################### scopeContent ##################################################################
+        ################################ publicationNote ###########################################################
+                
+                
+            relatedMaterial_description = record.find("related_material.free_text")
+            relatedMaterial_description = relatedMaterial_description.text if relatedMaterial_description is not None else None
 
-        scopeContent_description = record.find("Content_description/content.description")
-        scopeContent_description = scopeContent_description.text if scopeContent_description is not None else None
-
-        if scopeContent_description is not None:
-            scopeContent = []
-            scopeContent = {
-            "personNames": [
+            if relatedMaterial_description is not None:
+                relatedMaterial = []
+                relatedMaterial = [
             {
-            "firstName": None,
-            "surname": None,
-            #"startDate": None,
-            #"endDate": None
-        }
-        ],
-        "placeNames": [
-        {
-            "xReferenceName": None
-        }
-        ],
-        "refferedToDate": None,
-        "organizations": [
-        {
-            "xReferenceName": None
-        }
-        ],
-        "description": scopeContent_description,
-        "ephemera": None,
-        "occupations": None,
-        "schema": None
-    }
-
-        elif scopeContent_description is None:
-            scopeContent = []
-            scopeContent = {
-            "personNames": [
+            "xReferenceId": None,
+            "description":  relatedMaterial_description
+            }
+        ]
+            elif relatedMaterial_description is None:
+                relatedMaterial = []
+                relatedMaterial = [
             {
-            "firstName": None,
-            "surname": None,
-            #"startDate": None,
-            #"endDate": None
-        }
-        ],
-        "placeNames": [
-        {
-            "xReferenceName": None
-        }
-        ],
-        "refferedToDate": None,
-        "organizations": [
-        {
-            "xReferenceName": None
-        }
-        ],
-        "description": None,
-        "ephemera": None,
-        "occupations": None,
-        "schema": None
-    }
+            "xReferenceId": None,
+            "description":  None
+            }
+        ]
 
-    ########################################################################################################
+        ################################# separatedMaterial ##############################################################
 
-        #sortKey: generated automatically with ingest into MongoDB. Does not to have be included in JSON.
+            separatedMaterial = []
+            separatedMaterial = [
+            {
+            "xReferenceId": None,
+            "description": None
+            }
+        ]
 
-        #source ---> hard coded value "PA"
+        ###################################################################################################################
 
-        #subjects --> will not be used
-
-    ################################# subjects ##############################################################
-
-        subjects = []
-        subjects = [
-            None
-    ]
-
-    ###################################################################################################################
             
-        title = record.find("Title/title")
-        title = title.text if title is not None else None
-
-    ################################### unpublishedFindingAids ###########################################################
+            #registryRecords -- not used and not in JSON template
             
-        unpublishedFindingAids_string = record.find("Finding_aids/finding_aids")
-        unpublishedFindingAids_string = unpublishedFindingAids_string.text if unpublishedFindingAids_string is not None else None
-        unpublishedFindingAids = [unpublishedFindingAids_string]
+            #restrictionsOnUse = record.find("copyright_note")
+            #restrictionsOnUse = restrictionsOnUse.text if restrictionsOnUse is not None else None
+
+
+        ##################################### scopeContent ##################################################################
+
+            scopeContent_description = record.find("Content_description/content.description")
+            scopeContent_description = scopeContent_description.text if scopeContent_description is not None else None
+
+            if scopeContent_description is not None:
+                scopeContent = []
+                scopeContent = {
+                "personNames": [
+                {
+                "firstName": None,
+                "surname": None,
+                #"startDate": None,
+                #"endDate": None
+            }
+            ],
+            "placeNames": [
+            {
+                "xReferenceName": None
+            }
+            ],
+            "refferedToDate": None,
+            "organizations": [
+            {
+                "xReferenceName": None
+            }
+            ],
+            "description": scopeContent_description,
+            "ephemera": None,
+            "occupations": None,
+            "schema": None
+        }
+
+            elif scopeContent_description is None:
+                scopeContent = []
+                scopeContent = {
+                "personNames": [
+                {
+                "firstName": None,
+                "surname": None,
+                #"startDate": None,
+                #"endDate": None
+            }
+            ],
+            "placeNames": [
+            {
+                "xReferenceName": None
+            }
+            ],
+            "refferedToDate": None,
+            "organizations": [
+            {
+                "xReferenceName": None
+            }
+            ],
+            "description": None,
+            "ephemera": None,
+            "occupations": None,
+            "schema": None
+        }
+
+        ########################################################################################################
+
+            #sortKey: generated automatically with ingest into MongoDB. Does not to have be included in JSON.
+
+            #source ---> hard coded value "PA"
+
+            #subjects --> will not be used
+
+        ################################# subjects ##############################################################
+
+            subjects = []
+            subjects = [
+                None
+        ]
+
+        ###################################################################################################################
+                
+            title = record.find("Title/title")
+            title = title.text if title is not None else None
+
+        ################################### unpublishedFindingAids ###########################################################
+                
+            unpublishedFindingAids_string = record.find("Finding_aids/finding_aids")
+            unpublishedFindingAids_string = unpublishedFindingAids_string.text if unpublishedFindingAids_string is not None else None
+            unpublishedFindingAids = [unpublishedFindingAids_string]
+                
+        ########################################## storing XML values in JSON dictionary ###########################################
+
+            ##### Temporarly remove closure information for UK Parliament records that are closed (U status)
             
-    ########################################## storing XML values in JSON dictionary ###########################################
+            # if Jenny asks send U closure status for UK Parliament records to Discovery then deactive this IF statement (Discovery can handle U status)
 
-        ##### Temporarly remove closure information for UK Parliament records that are closed (U status)
-        
-        # if Jenny asks send U closure status for UK Parliament records to Discovery then deactive this IF statement (Discovery can handle U status)
-
-        if heldBy_information == "UK Parliament" and closureStatus == 'U':
-            mask_closure_status = True
-        else:
-            mask_closure_status = False
-        
-        if mask_closure_status:
-            record_data = { "record": {
-                            #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
-                            "iaid": iaid, 
-                        #"replicaId": None, 
-                        "citableReference": citableReference, 
-                        "parentId": parentId,
-                        #"accumulationDates": None,
-                        "accruals": accruals, 
-                        "accessConditions": accessConditions,
-                        "administrativeBackground": administrativeBackground,
-                        #"appraisalInformation": appraisalInformation,
-                        "arrangement": arrangement, #arrangement_system+' '+client_filepath,
-                        #"batchId": None,
-                        #"refIaid": None,
-                        "catalogueId": catalogueId,
-                        "catalogueLevel": catalogueLevel,
-                        "coveringFromDate": coveringFromDate,
-                        "coveringToDate": coveringToDate,
-                        "chargeType": chargeType,
-                        #"eDocumentId": None,
-                        "coveringDates": coveringDates,
-                        "custodialHistory": custodialHistory,
-                        #"closureCode": closureCode,
-                        #"closureStatus": closureStatus,
-                        #"closureType": closureType,
-                        #"recordOpeningDate": recordOpeningDate,
-                        #"corporateNames": None,
-                        "copiesInformation": copiesInformation,
-                        "creatorName": creatorName,
-                        "digitised": digitised,
-                        #"dimensions": None,
-                        "formerReferenceDep": formerReferenceDep,
-                        "formerReferencePro": formerReferencePro,
-                        "heldBy": heldBy,
-                        #"immediateSourceOfAcquisition": immediateSourceOfAcquisition,
-                        "language": language,
-                        "legalStatus": legalStatus,
-                        #"links": None,
-                        "locationOfOriginals": locationOfOriginals,
-                        #"mapDesignation": None,
-                        #"mapScaleNumber": None,
-                        #"note": None,
-                        #"people": people,
-                        #"physicalCondition": physicalCondition,
-                        "physicalDescriptionExtent": physicalDescriptionExtent,
-                        "physicalDescriptionForm": physicalDescriptionForm,
-                        #"places": places,
-                        "referencePart": referencePart,
-                        "publicationNote": publicationNote,
-                        "relatedMaterial": relatedMaterial,
-                        "separatedMaterial": separatedMaterial,
-                        #"restrictionsOnUse": restrictionsOnUse,
-                        "scopeContent": scopeContent,
-                        #"sortKey": None,
-                        "source": "PA",
-                        #"subjects": subjects,
-                        "title": title,
-                        "unpublishedFindingAids": unpublishedFindingAids
+            if heldBy_information == "UK Parliament" and closureStatus == 'U':
+                mask_closure_status = True
+            else:
+                mask_closure_status = False
+            
+            if mask_closure_status:
+                record_data = { "record": {
+                                #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
+                                "iaid": iaid, 
+                            #"replicaId": None, 
+                            "citableReference": citableReference, 
+                            "parentId": parentId,
+                            #"accumulationDates": None,
+                            "accruals": accruals, 
+                            "accessConditions": accessConditions,
+                            "administrativeBackground": administrativeBackground,
+                            #"appraisalInformation": appraisalInformation,
+                            "arrangement": arrangement, #arrangement_system+' '+client_filepath,
+                            #"batchId": None,
+                            #"refIaid": None,
+                            "catalogueId": catalogueId,
+                            "catalogueLevel": catalogueLevel,
+                            "coveringFromDate": coveringFromDate,
+                            "coveringToDate": coveringToDate,
+                            "chargeType": chargeType,
+                            #"eDocumentId": None,
+                            "coveringDates": coveringDates,
+                            "custodialHistory": custodialHistory,
+                            #"closureCode": closureCode,
+                            #"closureStatus": closureStatus,
+                            #"closureType": closureType,
+                            #"recordOpeningDate": recordOpeningDate,
+                            #"corporateNames": None,
+                            "copiesInformation": copiesInformation,
+                            "creatorName": creatorName,
+                            "digitised": digitised,
+                            #"dimensions": None,
+                            "formerReferenceDep": formerReferenceDep,
+                            "formerReferencePro": formerReferencePro,
+                            "heldBy": heldBy,
+                            #"immediateSourceOfAcquisition": immediateSourceOfAcquisition,
+                            "language": language,
+                            "legalStatus": legalStatus,
+                            #"links": None,
+                            "locationOfOriginals": locationOfOriginals,
+                            #"mapDesignation": None,
+                            #"mapScaleNumber": None,
+                            #"note": None,
+                            #"people": people,
+                            #"physicalCondition": physicalCondition,
+                            "physicalDescriptionExtent": physicalDescriptionExtent,
+                            "physicalDescriptionForm": physicalDescriptionForm,
+                            #"places": places,
+                            "referencePart": referencePart,
+                            "publicationNote": publicationNote,
+                            "relatedMaterial": relatedMaterial,
+                            "separatedMaterial": separatedMaterial,
+                            #"restrictionsOnUse": restrictionsOnUse,
+                            "scopeContent": scopeContent,
+                            #"sortKey": None,
+                            "source": "PA",
+                            #"subjects": subjects,
+                            "title": title,
+                            "unpublishedFindingAids": unpublishedFindingAids
+                            }
                         }
-                    }
 
-        #### JSON mapping for all other types of records
-        else:
-            record_data = { "record": {
-                            #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
-                            "iaid": iaid, 
-                        #"replicaId": None, 
-                        "citableReference": citableReference, 
-                        "parentId": parentId,
-                        #"accumulationDates": None,
-                        "accruals": accruals, 
-                        "accessConditions": accessConditions,
-                        "administrativeBackground": administrativeBackground,
-                        #"appraisalInformation": appraisalInformation,
-                        "arrangement": arrangement, #arrangement_system+' '+client_filepath,
-                        #"batchId": None,
-                        #"refIaid": None,
-                        "catalogueId": catalogueId,
-                        "catalogueLevel": catalogueLevel,
-                        "coveringFromDate": coveringFromDate,
-                        "coveringToDate": coveringToDate,
-                        "chargeType": chargeType,
-                        #"eDocumentId": None,
-                        "coveringDates": coveringDates,
-                        "custodialHistory": custodialHistory,
-                        "closureCode": closureCode,
-                        "closureStatus": closureStatus,
-                        "closureType": closureType,
-                        "recordOpeningDate": recordOpeningDate,
-                        #"corporateNames": None,
-                        "copiesInformation": copiesInformation,
-                        "creatorName": creatorName,
-                        "digitised": digitised,
-                        #"dimensions": None,
-                        "formerReferenceDep": formerReferenceDep,
-                        "formerReferencePro": formerReferencePro,
-                        "heldBy": heldBy,
-                        #"immediateSourceOfAcquisition": immediateSourceOfAcquisition,
-                        "language": language,
-                        "legalStatus": legalStatus,
-                        #"links": None,
-                        "locationOfOriginals": locationOfOriginals,
-                        #"mapDesignation": None,
-                        #"mapScaleNumber": None,
-                        #"note": None,
-                        #"people": people,
-                        #"physicalCondition": physicalCondition,
-                        "physicalDescriptionExtent": physicalDescriptionExtent,
-                        "physicalDescriptionForm": physicalDescriptionForm,
-                        #"places": places,
-                        "referencePart": referencePart,
-                        "publicationNote": publicationNote,
-                        "relatedMaterial": relatedMaterial,
-                        "separatedMaterial": separatedMaterial,
-                        #"restrictionsOnUse": restrictionsOnUse,
-                        "scopeContent": scopeContent,
-                        #"sortKey": None,
-                        "source": "PA",
-                        #"subjects": subjects,
-                        "title": title,
-                        "unpublishedFindingAids": unpublishedFindingAids
+            #### JSON mapping for all other types of records
+            else:
+                record_data = { "record": {
+                                #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
+                                "iaid": iaid, 
+                            #"replicaId": None, 
+                            "citableReference": citableReference, 
+                            "parentId": parentId,
+                            #"accumulationDates": None,
+                            "accruals": accruals, 
+                            "accessConditions": accessConditions,
+                            "administrativeBackground": administrativeBackground,
+                            #"appraisalInformation": appraisalInformation,
+                            "arrangement": arrangement, #arrangement_system+' '+client_filepath,
+                            #"batchId": None,
+                            #"refIaid": None,
+                            "catalogueId": catalogueId,
+                            "catalogueLevel": catalogueLevel,
+                            "coveringFromDate": coveringFromDate,
+                            "coveringToDate": coveringToDate,
+                            "chargeType": chargeType,
+                            #"eDocumentId": None,
+                            "coveringDates": coveringDates,
+                            "custodialHistory": custodialHistory,
+                            "closureCode": closureCode,
+                            "closureStatus": closureStatus,
+                            "closureType": closureType,
+                            "recordOpeningDate": recordOpeningDate,
+                            #"corporateNames": None,
+                            "copiesInformation": copiesInformation,
+                            "creatorName": creatorName,
+                            "digitised": digitised,
+                            #"dimensions": None,
+                            "formerReferenceDep": formerReferenceDep,
+                            "formerReferencePro": formerReferencePro,
+                            "heldBy": heldBy,
+                            #"immediateSourceOfAcquisition": immediateSourceOfAcquisition,
+                            "language": language,
+                            "legalStatus": legalStatus,
+                            #"links": None,
+                            "locationOfOriginals": locationOfOriginals,
+                            #"mapDesignation": None,
+                            #"mapScaleNumber": None,
+                            #"note": None,
+                            #"people": people,
+                            #"physicalCondition": physicalCondition,
+                            "physicalDescriptionExtent": physicalDescriptionExtent,
+                            "physicalDescriptionForm": physicalDescriptionForm,
+                            #"places": places,
+                            "referencePart": referencePart,
+                            "publicationNote": publicationNote,
+                            "relatedMaterial": relatedMaterial,
+                            "separatedMaterial": separatedMaterial,
+                            #"restrictionsOnUse": restrictionsOnUse,
+                            "scopeContent": scopeContent,
+                            #"sortKey": None,
+                            "source": "PA",
+                            #"subjects": subjects,
+                            "title": title,
+                            "unpublishedFindingAids": unpublishedFindingAids
+                            }
                         }
-                    }
-            
-    
-        def _clean_none(obj):
-            """Recursively remove None values and empty containers.
-            - dict: remove keys with None/empty; return None if dict becomes empty
-            - list: keep only cleaned items that are not None/empty; return None if list becomes empty
-            - other: return as-is (None returns None)
-            """
-            if obj is None:
-                return None
-            if isinstance(obj, dict):
-                new = {}
-                for k, v in obj.items():
-                    cv = _clean_none(v)
-                    if cv is None:
-                        continue
-                    if isinstance(cv, (list, dict)) and len(cv) == 0:
-                        continue
-                    new[k] = cv
-                return new if new else None
-            if isinstance(obj, list):
-                new_list = []
-                for item in obj:
-                    ci = _clean_none(item)
-                    if ci is None:
-                        continue
-                    if isinstance(ci, (list, dict)) and len(ci) == 0:
-                        continue
-                    new_list.append(ci)
-                return new_list if new_list else None
-            return obj
-            
-        # remove unnecessary fields (with null values only) if requested
-        if remove_empty_fields:
-            # prune None/empty fields from the record prior to writing JSON
-            cleaned = _clean_none(record_data)
-            if cleaned is None:
-                # ensure we still write a minimal record object if everything pruned
-                cleaned = {"record": {}}
-            elif not isinstance(cleaned, dict) or "record" not in cleaned:
-                # defensive: ensure top-level shape is preserved
-                cleaned = {"record": cleaned}
-
-            records[iaid] = cleaned
-        else:
-            records[iaid] = record_data
+                
         
-        # update diagnostics
-        _records_processed += 1
-        estimated_time_remaining = (_total_records - _records_processed) * (time.time() - start_time) / _records_processed
-        print(f"Processed [{i}/{_total_records}]: Estimated time remaining: {estimated_time_remaining/60:.1f} minutes. {_records_processed} / {_total_records} records "
-              f"{(_records_processed/_total_records)*100:.0f}%", end='\r')
-        sys.stdout.flush()
+            def _clean_none(obj):
+                """Recursively remove None values and empty containers.
+                - dict: remove keys with None/empty; return None if dict becomes empty
+                - list: keep only cleaned items that are not None/empty; return None if list becomes empty
+                - other: return as-is (None returns None)
+                """
+                if obj is None:
+                    return None
+                if isinstance(obj, dict):
+                    new = {}
+                    for k, v in obj.items():
+                        cv = _clean_none(v)
+                        if cv is None:
+                            continue
+                        if isinstance(cv, (list, dict)) and len(cv) == 0:
+                            continue
+                        new[k] = cv
+                    return new if new else None
+                if isinstance(obj, list):
+                    new_list = []
+                    for item in obj:
+                        ci = _clean_none(item)
+                        if ci is None:
+                            continue
+                        if isinstance(ci, (list, dict)) and len(ci) == 0:
+                            continue
+                        new_list.append(ci)
+                    return new_list if new_list else None
+                return obj
+                
+            # remove unnecessary fields (with null values only) if requested
+            if remove_empty_fields:
+                # prune None/empty fields from the record prior to writing JSON
+                cleaned = _clean_none(record_data)
+                if cleaned is None:
+                    # ensure we still write a minimal record object if everything pruned
+                    cleaned = {"record": {}}
+                elif not isinstance(cleaned, dict) or "record" not in cleaned:
+                    # defensive: ensure top-level shape is preserved
+                    cleaned = {"record": cleaned}
 
-    print(f"{len(records)} records processed from the XML file.")
-    return records
+                records[iaid] = cleaned
+            else:
+                records[iaid] = record_data
+            
+            # update diagnostics
+            _records_processed += 1
+            if progress_verbose:
+                tick(_records_processed)
+            #if progress_verbose:
+            #    print()  # newline after progress
+        elapsed = pytime.perf_counter() - loop_start
+        safe_elapsed = max(elapsed, 0.25)  # prevent extreme inflation
+        if safe_elapsed < 60:
+            print(f"Elapsed time: {safe_elapsed:.2f} seconds")
+            avg_rate = _records_processed / safe_elapsed
+            rate_label = "records/sec"
+        else:
+            avg_rate = (_records_processed / safe_elapsed) * 60.0
+            rate_label = "records/min"
+        print(f"{_records_processed} records processed from XML "
+            f"(elapsed {_fmt_duration(elapsed)}) "
+            f"avg {avg_rate:.1f} {rate_label}")
+        
+        return records
+
 
 class NewlineToPTransformer():
     def __init__(self, target_columns: Optional[Iterable[str]] = None, match="\\n", replace="<p>"):

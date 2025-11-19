@@ -16,8 +16,9 @@ from dotenv import load_dotenv
 import contextlib
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
+import time as pytime
 
 def set_project_root(marker: str = "README.md") -> str:
     """
@@ -77,13 +78,71 @@ def log_timing(operation_name: str, logger: Optional[logging.Logger] = None):
         yield
     finally:
         duration = time.perf_counter() - start
-        hh = int(duration // 3600)
-        mm = int(duration // 60)
-        ss = duration % 60
+        hours, rem = divmod(duration, 3600)
+        minutes, seconds = divmod(rem, 60)
         end_ts = datetime.now().isoformat()
-        logger.info("Finished %s at %s (duration %dh %dm %.2fs)", operation_name.lower(), end_ts, hh, mm, ss)
+        logger.info(
+            "Finished %s at %s (duration %dh %dm %.2fs)",
+            operation_name.lower(),
+            end_ts,
+            int(hours),
+            int(minutes),
+            seconds
+        )
 
 
+@contextlib.contextmanager
+def progress_context(total: int, interval: int = 500, label: str = "process"):
+    """Lightweight progress reporting context.
+
+    Yields a ``tick(done_count)`` function. Call it every *interval* items
+    (or always, your choice) to print rate and ETA (HH:MM). No class
+    instantiation per iteration; minimal overhead.
+
+    Example:
+        with progress_context(total=N, interval=1000, label="xml->json") as tick:
+            for i in range(N):
+                # ... work ...
+                tick(i + 1)
+    """
+    start = pytime.time()
+
+    def _format_line(done: int, elapsed: float) -> str:
+        rate = (done / elapsed) * 60.0 if elapsed > 0 else 0.0
+        remaining = total - done
+        eta_secs = (remaining * (elapsed / done)) if done > 0 else 0
+        eta_str = (datetime.now() + timedelta(seconds=eta_secs)).strftime("%H:%M")
+        return (f"[{label}] {done}/{total} ({done/total*100:.0f}%) | "
+                f"Rate: {rate:.0f}/min | ETA ~ {eta_str}    ")
+
+    def tick(done: int):
+        # Suppress final print; handled once in finally
+        if done == total:
+            return
+        if done % interval == 0:
+            elapsed = pytime.time() - start
+            print(_format_line(done, elapsed), end='\r')
+
+    try:
+        yield tick
+    finally:
+        elapsed = pytime.time() - start
+        # Final line (no carriage return; ends with newline)
+        print(_format_line(total, elapsed))
+        # Ensure cursor on next line
+        print()
+
+# helper to format duration
+def _fmt_duration(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    # use mod to get remainders for formatting (so we don't get more than 60 minutes etc)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{int(h)}h {int(m)}m {s:.1f}s"
+    if m:
+        return f"{int(m)}m {s:.1f}s"
+    return f"{s:.2f}s"
 
 # List of XML files to merge
 load_dotenv(Path.cwd() / ".env")
@@ -289,113 +348,88 @@ def filter_xml_by_iaid(xml_path: Union[str, Path], target_iaid: str, output_path
     
     return output_path
     
-# manifest helpers    
-def load_manifest(manifest_filename, s3, bucket, s3_output_folder, logger):
-    """Load the manifest of uploaded records from S3"""
-    manifest_key = f"{s3_output_folder}/{manifest_filename}"
-    
+############################
+# transfer register helpers
+############################
+def load_transfer_register(register_filename, s3, bucket, s3_output_folder, logger):
+    """Load the transfer register (previously called manifest) from S3."""
+    key = f"{s3_output_folder}/{register_filename}"
     try:
-        response = s3.get_object(Bucket=bucket, Key=manifest_key)
-        manifest = json.loads(response['Body'].read().decode('utf-8'))
-        logger.info("Loaded manifest with %d records", len(manifest.get('records', {})))
-        return manifest
+        response = s3.get_object(Bucket=bucket, Key=key)
+        register = json.loads(response['Body'].read().decode('utf-8'))
+        logger.info("Loaded transfer register with %d records", len(register.get('records', {})))
+        return register
     except s3.exceptions.NoSuchKey:
-        logger.info("Manifest file not found, creating new one")
+        logger.info("Transfer register file not found, creating new one")
         return {"last_updated": None, "total_records": 0, "records": {}}
     except Exception as e:
-        logger.exception("Error loading manifest: %s", e)
+        logger.exception("Error loading transfer register: %s", e)
         return {"last_updated": None, "total_records": 0, "records": {}}
 
-def save_manifest(manifest_filename, s3, bucket, output_dir, manifest, logger):
-    """Save the manifest of uploaded records to S3 (with timestamped backup of existing)"""
-    manifest_key = f"{output_dir}/{manifest_filename}"
-    
+def save_transfer_register(register_filename, s3, bucket, output_dir, register, logger):
+    """Save the transfer register to S3 with a timestamped backup of existing (backward compatible with manifest)."""
+    key = f"{output_dir}/{register_filename}"
     try:
-        # Check if manifest already exists and create a backup copy
         try:
-            s3.head_object(Bucket=bucket, Key=manifest_key)
-            # Manifest exists, create timestamped backup
+            s3.head_object(Bucket=bucket, Key=key)
             timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-            base_name = Path(manifest_filename).stem
-            ext = Path(manifest_filename).suffix
+            base_name = Path(register_filename).stem
+            ext = Path(register_filename).suffix
             backup_filename = f"{base_name}_copy_{timestamp}{ext}"
             backup_key = f"{output_dir}/{backup_filename}"
-            
-            # Copy existing manifest to backup
-            s3.copy_object(
-                Bucket=bucket,
-                CopySource={'Bucket': bucket, 'Key': manifest_key},
-                Key=backup_key
-            )
-            logger.info("Created backup of existing manifest: s3://%s/%s", bucket, backup_key)
+            s3.copy_object(Bucket=bucket, CopySource={'Bucket': bucket, 'Key': key}, Key=backup_key)
+            logger.info("Created backup of existing transfer register: s3://%s/%s", bucket, backup_key)
         except s3.exceptions.ClientError as e:
             if e.response['Error']['Code'] == '404':
-                # Manifest doesn't exist yet, no backup needed
-                logger.info("No existing manifest to backup")
+                logger.info("No existing transfer register to backup")
             else:
                 raise
-        
-        # Save the new manifest
-        manifest['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        manifest['total_records'] = len(manifest.get('records', {}))
-        
-        manifest_json = json.dumps(manifest, indent=2, ensure_ascii=False)
-        s3.put_object(
-            Bucket=bucket,
-            Key=manifest_key,
-            Body=manifest_json.encode('utf-8'),
-            ContentType='application/json'
-        )
-        logger.info("Saved manifest with %d total records to s3://%s/%s", 
-                   manifest['total_records'], bucket, manifest_key)
+        register['last_updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        register['total_records'] = len(register.get('records', {}))
+        body = json.dumps(register, indent=2, ensure_ascii=False).encode('utf-8')
+        s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType='application/json')
+        logger.info("Saved transfer register with %d total records to s3://%s/%s", register['total_records'], bucket, key)
     except Exception as e:
-        logger.exception("Error saving manifest: %s", e)
+        logger.exception("Error saving transfer register: %s", e)
 
-def filter_new_records(records, manifest, logger):
-    """Filter out already-uploaded records using manifest"""
-    uploaded_iaids = set(manifest.get('records', {}).keys())
+def filter_new_records(records, transfer_register, logger):
+    """Filter out already-uploaded records using transfer register"""
+    uploaded_iaids = set(transfer_register.get('records', {}).keys())
     new_records = {}
     skipped_count = 0
-    
+
     for iaid, record_data in records.items():
         if iaid in uploaded_iaids:
             logger.debug("Skipping already-uploaded record: %s", iaid)
             skipped_count += 1
             continue
-        
         new_records[iaid] = record_data
-    
-    logger.info("Filtered %d new records (skipped %d duplicates)", 
-               len(new_records), skipped_count)
+
+    logger.info("Filtered %d new records (skipped %d duplicates)", len(new_records), skipped_count)
     return new_records
 
-def update_manifest_with_records(manifest, records, source_file, bucket, s3_output_folder, logger):
-    """Add newly uploaded records to manifest (excluding the deepest/leaf level in this tree)"""
-    if 'records' not in manifest:
-        manifest['records'] = {}
-    
-    # Find the deepest level in this tree
+def update_transfer_register_with_records(transfer_register, records, source_file, bucket, s3_output_folder, logger):
+    """Add newly uploaded records to transfer register (excluding the deepest/leaf level)."""
+    if 'records' not in transfer_register:
+        transfer_register['records'] = {}
+
     max_level = 0
     for iaid, record_data in records.items():
         catalogue_level = record_data.get('record', {}).get('catalogueLevel', 0)
         if catalogue_level > max_level:
             max_level = catalogue_level
-    
-    logger.info("Tree max catalogue level: %d - will track all levels except %d", max_level, max_level)
-    
+
+    logger.info("Tree max catalogue level: %d - tracking all except deepest", max_level)
+
     added_count = 0
     skipped_count = 0
-    
     for iaid, record_data in records.items():
         catalogue_level = record_data.get('record', {}).get('catalogueLevel', 0)
-        
-        # Skip the deepest level (leaf records that are unique per tree)
         if catalogue_level == max_level:
             logger.debug("Skipping leaf record %s (level %d)", iaid, catalogue_level)
             skipped_count += 1
             continue
-        
-        manifest['records'][iaid] = {
+        transfer_register['records'][iaid] = {
             'reference': record_data.get('record', {}).get('citableReference', 'N/A'),
             'uploaded_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'uploaded_to': f"s3://{bucket}/{s3_output_folder}",
@@ -408,6 +442,6 @@ def update_manifest_with_records(manifest, records, source_file, bucket, s3_outp
             'catalogue_level': catalogue_level
         }
         added_count += 1
-    
-    logger.info("Added %d records to manifest, skipped %d leaf records", added_count, skipped_count)
-    return manifest
+
+    logger.info("Added %d records to transfer register, skipped %d leaf records", added_count, skipped_count)
+    return transfer_register
