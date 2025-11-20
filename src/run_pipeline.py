@@ -274,6 +274,8 @@ def lambda_handler(event, context):
                     task = transformation_config['tasks'].get('y_naming')
                     y = YNamingTransformer(target_columns=task.get('target_columns'))
                     transformed_json = y.transform(transformed_json)
+
+                    # (replica enrichment removed in this branch)
                     
                     # Save post-transformation JSON (after all transformers)
                     if save_intermediates and run_mode == "local":

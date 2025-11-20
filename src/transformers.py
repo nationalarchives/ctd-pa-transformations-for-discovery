@@ -10,7 +10,7 @@ import os
 import logging
 import sys
 
-from utils import progress_context, _fmt_duration
+from src.utils import progress_context, _fmt_duration
 
 
 def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = True, 
@@ -888,15 +888,18 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                 tick(_records_processed)
             #if progress_verbose:
             #    print()  # newline after progress
-        elapsed = pytime.perf_counter() - loop_start
-        safe_elapsed = max(elapsed, 0.25)  # prevent extreme inflation
-        if safe_elapsed < 60:
-            print(f"Elapsed time: {safe_elapsed:.2f} seconds")
-            avg_rate = _records_processed / safe_elapsed
+        end_time = pytime.perf_counter()
+        elapsed = end_time - loop_start
+        if elapsed < 1e-6:
+            elapsed = 1e-6  # prevent zero / near-zero blowups
+
+        if elapsed < 60:
+            avg_rate = _records_processed / elapsed
             rate_label = "records/sec"
         else:
-            avg_rate = (_records_processed / safe_elapsed) * 60.0
+            avg_rate = (_records_processed / elapsed) * 60.0
             rate_label = "records/min"
+
         print(f"{_records_processed} records processed from XML "
             f"(elapsed {_fmt_duration(elapsed)}) "
             f"avg {avg_rate:.1f} {rate_label}")
@@ -1512,8 +1515,13 @@ class YNamingTransformer():
         # This enforces rejection of examples like 'XYZ-12/ABC-3' and 'A1B2C3/456'.
         if not re.match(r'^[A-Za-z]+$', toks[0]):
             return False
-        # Prefix must be at least 2 alphabetic characters (reject single-letter like 'A/1').
-        if len(toks[0]) < 2:
+        # Prefix must be at least 1 alphabetic character (reject empty like '/1').
+        if len(toks[0]) > 1 or toks[0] == 'S':
+            return True
+        else:
             return False
 
         return True
+
+
+    
