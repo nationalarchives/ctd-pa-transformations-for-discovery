@@ -19,7 +19,8 @@ sys.path.insert(0, str(repo_root))
 from src.config_loader import UniversalConfig
 from src.utils import find_key, merge_xml_files, log_timing, _load_json_file, filter_xml_by_iaid
 from src.utils import load_transfer_register, save_transfer_register, filter_new_records, update_transfer_register_with_records
-from src.transformers import NewlineToPTransformer, YNamingTransformer, convert_to_json
+from src.utils import insert_ordered, progress_context
+from src.transformers import NewlineToPTransformer, YNamingTransformer, ReplicaDataTransformer, convert_to_json
 
 
 # load in the environment variables from .env in repo root (done by AWS Lambda automatically)
@@ -85,6 +86,10 @@ transfer_register_filename = os.getenv("TRANSFER_REGISTER_FILENAME", "uploaded_r
 
 def lambda_handler(event, context):
 
+    # log when process was started
+    start_time = datetime.now()
+    logger.info("Lambda handler started at %s", start_time.isoformat())
+
     # 1. Get bucket and key from event
     record = event['Records'][0]
     bucket = record['s3']['bucket']['name']
@@ -143,6 +148,19 @@ def lambda_handler(event, context):
     # set other paths to None initially
     xml_path_to_convert = None
     tmp_path = None
+
+    # filter iaid list for replica metadata to those in bucket before applying replica transformer
+    replica_prefix = os.getenv("REPLICA_METADATA_PREFIX", "metadata")
+    paginator = s3.get_paginator('list_objects_v2')
+    operation_parameters = {'Bucket': bucket,
+                            'Prefix': replica_prefix}
+    page_iterator = paginator.paginate(**operation_parameters,
+                PaginationConfig={'MaxItems': 5000})
+    
+    replica_list = []
+    for page in page_iterator:
+        replica_list.append(page.get('Contents', []))
+    replica_files = set([Path(obj['Key']).stem for sublist in replica_list for obj in sublist])
 
     # Download from S3 in S3 modes (local_s3 or remote_s3)
     if run_mode in ["local_s3", "remote_s3"]:
@@ -209,7 +227,7 @@ def lambda_handler(event, context):
             records = filter_new_records(records, transfer_register, logger)
             removed = before - len(records)
             if removed:
-                logger.info("Dedup removed %d records; %d remain", removed, len(records))
+                logger.info("Dedupe proc removed %d records; %d remain", removed, len(records))
     except Exception:
         logger.exception("Conversion failed")
         return {"status": "error", "message": f"Conversion failed for {xml_path_to_convert.name}"}
@@ -221,7 +239,7 @@ def lambda_handler(event, context):
                 logger.warning("Could not remove temp file %s", tmp_path)
 
     # 3. Load the converted JSON (convert_xml_to_json should have written it)
-    converted_xml_to_json_files = records
+    converted_xml_to_json_files = records 
 
     # save the converted files to disk to investigation if option selected
     save_intermediate = os.getenv("DEBUG_TRANSFORMERS", "true").strip().lower() in truthy_chars
@@ -240,8 +258,9 @@ def lambda_handler(event, context):
         # Collect transformed JSONs by level (in memory)
         jsons_by_level = {}  # {level_name: [(filename, json_dict), ...]}
 
-        with log_timing("Applying transformations", logger):
-            for filename, _file in converted_xml_to_json_files.items():
+        logger.info("Applying transformations to %d JSON files...", len(converted_xml_to_json_files))
+        with progress_context(total = len(converted_xml_to_json_files), interval=100) as tick:
+            for i, (filename, _file) in enumerate(converted_xml_to_json_files.items(), start=1):
 
                 # set up transformation config
                 record_level_mapping = transformation_config.get("record_level_mapping", {})
@@ -266,16 +285,31 @@ def lambda_handler(event, context):
                     # newline to <p> transformation
                     transformed_json = None
                     task = transformation_config['tasks'].get('newline_to_p', {})
-                    n = NewlineToPTransformer(target_columns=task.get('target_columns'),
+                    npt = NewlineToPTransformer(target_columns=task.get('target_columns'),
                                               **task.get('params', {}))
-                    transformed_json = n.transform(_file)
+                    transformed_json = npt.transform(_file)
 
                     # Y naming transformation
                     task = transformation_config['tasks'].get('y_naming')
-                    y = YNamingTransformer(target_columns=task.get('target_columns'))
-                    transformed_json = y.transform(transformed_json)
+                    yt = YNamingTransformer(target_columns=task.get('target_columns'))
+                    transformed_json = yt.transform(transformed_json)
 
-                    # (replica enrichment removed in this branch)
+                    # Replica data transformation
+                    do_replicas = True
+                    if do_replicas:
+
+                        # Insert 'replicaID' at position 1 in the record dictionary
+                        transformed_json["record"] = insert_ordered(
+                                transformed_json["record"], "replicaId", None, 1
+                            )
+
+                        # now process replica metadata if available
+                        if filename in replica_files:
+                            print(f"Processing replica metadata for file: {filename}", end='\r')
+                            rtd = ReplicaDataTransformer(bucket_name=bucket,
+                                                            prefix=replica_prefix,
+                                                            s3_client=s3 if run_mode in ["local_s3", "remote_s3"] else None)
+                            transformed_json = rtd.transform(transformed_json)
                     
                     # Save post-transformation JSON (after all transformers)
                     if save_intermediates and run_mode == "local":
@@ -307,6 +341,8 @@ def lambda_handler(event, context):
                     return {"status": "error", "message": f"Error applying "
                             f"transformations for {filename}.json"}
                 successfully_transformed_files.append(filename)
+
+                tick(i)
 
     # Create in-memory tarballs for each level
     if jsons_by_level and run_mode in ['local_s3', 'remote_s3']:
@@ -405,8 +441,14 @@ def lambda_handler(event, context):
 
 
     if len(successfully_transformed_files) > 0:
-        logger.info("Processed %s successfully", key)
-        return {"status": "ok", "message": f"Processed {key} successfully."}
+        end_time = datetime.now()
+        duration = (end_time - start_time).total_seconds()
+        h, rem = divmod(duration, 3600)
+        m, s = divmod(rem, 60)
+        logger.info("Processed %s successfully from %s to %s "
+        "(Duration: %02d:%02d:%02d)", key, start_time, end_time, int(h), int(m), int(s))
+        return {"status": "ok", "message": f"Processed {key} successfully "
+                f" (Duration: {int(h):02d}:{int(m):02d}:{int(s):02d})"}
     else:
         logger.error("No transformed JSON generated for %s", key)
         return {"status": "error", "message": f"No transformed JSON generated for {key}"}

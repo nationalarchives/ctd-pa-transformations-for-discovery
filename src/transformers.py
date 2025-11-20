@@ -355,7 +355,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         if catalogueLevel <= 8:
             production_elements = record.findall("Production")
             creatorName = []
-        #Looping through each production element to find creator sub-elements
+            #Looping through each production element to find creator sub-elements
             if production_elements:
                 for production in production_elements:
                     creator_element = production.find("creator")
@@ -369,17 +369,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                             "startDate": 0,
                             "endDate": 0
                         })
+        else:
+            creatorName = None # Temporary line to enable testing
 
-                    if not creatorName:
-                        creatorName = [{
-                            "xReferenceName": None,
-                            "preTitle": None,
-                            "title": None,
-                            "firstName": None,
-                            "surname": None,
-                            "startDate": 0,
-                            "endDate": 0
-                        }]
 
     ############################ digitised ##########################################################
 
@@ -704,7 +696,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         # if Jenny asks send U closure status for UK Parliament records to Discovery then deactive this IF statement (Discovery can handle U status)
 
         if heldBy_information == "UK Parliament" and closureStatus == 'U':
-            mask_closure_status = False
+            mask_closure_status = True
         else:
             mask_closure_status = False
 
@@ -832,7 +824,6 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                         "unpublishedFindingAids": unpublishedFindingAids
                         }
                     }
-
 
         def _clean_none(obj):
             """Recursively remove None values and empty containers.
@@ -1504,5 +1495,109 @@ class YNamingTransformer():
 
         return True
 
+
+class ReplicaDataTransformer:
+    """Enrich records with replica metadata JSON loaded from S3.
+
+    Behavior:
+    - For each JSON record (dict with key 'record' containing 'iaid'), attempt to fetch
+      a JSON file named <iaid>.json from the configured S3 bucket/prefix.
+    - If found and valid JSON, attach under record['replicaMetadata'].
+    - Errors (missing object, parse issues, credentials) are logged at DEBUG/INFO and skipped.
+
+    Environment integration (optional):
+    - ENABLE_REPLICA_METADATA=1 enables transformer usage in the pipeline (handled in run_pipeline).
+    - REPLICA_METADATA_BUCKET overrides the source bucket if different from main ingest bucket.
+    - REPLICA_METADATA_PREFIX customises prefix (defaults to 'metadata').
+    """
+
+    def __init__(self,
+                 bucket_name: str,
+                 prefix: str = "replica",
+                 s3_client=None,
+                 timeout_seconds: int = 5):
+        import logging
+        self.logger = logging.getLogger("pipeline.transformers.replica")
+        self.bucket = bucket_name
+        self.prefix = prefix.strip().strip('/') if prefix else ''
+        self.s3 = s3_client
+        self.timeout_seconds = timeout_seconds
+        if self.s3 is None:
+            try:
+                import boto3
+                self.s3 = boto3.client('s3')
+            except Exception as e:
+                self.logger.warning("Unable to create boto3 client for replica metadata: %s", e)
+                self.s3 = None
+
+    def _object_key(self, iaid: str) -> str:
+        if not iaid:
+            return ''
+        if self.prefix:
+            return f"{self.prefix}/{iaid}.json"
+        return f"{iaid}.json"
+
+    def _fetch_metadata(self, iaid: str):
+        if not self.s3 or not iaid:
+            return None
+        key = self._object_key(iaid)
+        try:
+            from botocore.exceptions import ClientError
+            resp = self.s3.get_object(Bucket=self.bucket, Key=key)
+            import json
+            body = resp.get('Body')
+            if not body:
+                return None
+            raw = body.read()
+            if not raw:
+                return None
+            try:
+                data = json.loads(raw.decode('utf-8'))
+            except Exception as e:
+                self.logger.debug("Invalid JSON for replica %s: %s", iaid, e)
+                return None
+            if isinstance(data, dict):
+                return data
+            return None
+        except ClientError as ce:
+            code = (ce.response or {}).get('Error', {}).get('Code')
+            # Treat not found / no such key silently
+            if code in ("NoSuchKey", "404"):
+                self.logger.debug("Replica metadata missing for %s (key=%s)", iaid, key)
+                return None
+            self.logger.info("Replica metadata fetch error for %s: %s", iaid, code)
+            return None
+        except Exception as e:
+            self.logger.info("Replica metadata unexpected error for %s: %s", iaid, e)
+            return None
+
+    def transform(self, json_record: dict):
+        """Attach replica metadata (if available) to a single record JSON dict.
+
+        Expects structure: {"record": {"iaid": <value>, ...}}
+        Returns mutated copy (does not modify in-place external reference).
+        """
+        import copy
+        if not isinstance(json_record, dict):
+            return json_record
+        if 'record' not in json_record or not isinstance(json_record['record'], dict):
+            return json_record
+        iaid = json_record['record'].get('iaid')
+        meta = self._fetch_metadata(iaid)
+        if meta:
+            out = copy.deepcopy(json_record)
+            out['record']['replica'] = meta
+            out['record']['replicaId'] = meta.get('replicaId')
+            return out
+        return json_record
+
+    def batch_transform(self, records: dict) -> dict:
+        """Transform a mapping of iaid -> json record dicts."""
+        if not isinstance(records, dict):
+            return records
+        result = {}
+        for iaid, rec in records.items():
+            result[iaid] = self.transform(rec)
+        return result
 
     

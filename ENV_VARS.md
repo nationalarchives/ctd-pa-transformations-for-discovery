@@ -22,9 +22,9 @@
 - **Description**: Path to transformation config JSON file or JSON string
 - **Example**: `config/transformation_config.json`
 
-### `MANIFEST_FILENAME`
-- **Default**: `uploaded_records_manifest.json`
-- **Description**: Filename for deduplication manifest in S3
+### `TRANSFER_REGISTER_FILENAME`
+- **Default**: `uploaded_records_transfer_register.json`
+- **Description**: Filename for deduplication transfer register stored in S3
 
 ---
 
@@ -94,6 +94,19 @@
 - **Description**: Merge multiple XML files before processing
 
 ### `CTD_TRIGGER_JSON`
+### `ENABLE_REPLICA_METADATA`
+- **Values**: `1`, `true`, `y`, `0`, `false`
+- **Default**: `0`
+- **Description**: When truthy, enables replica metadata enrichment transformer.
+
+### `REPLICA_METADATA_BUCKET`
+- **Default**: Uses ingest event bucket if unset
+- **Description**: S3 bucket containing per-record replica metadata JSON files named `<IAID>.json`.
+
+### `REPLICA_METADATA_PREFIX`
+- **Default**: `replica`
+- **Description**: Prefix (folder) inside `REPLICA_METADATA_BUCKET` where metadata JSON files reside.
+
 - **Default**: `trigger.json`
 - **Description**: Path to trigger JSON for local execution
 
