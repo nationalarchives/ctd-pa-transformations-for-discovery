@@ -3,14 +3,11 @@ import copy
 from typing import Any, Optional, Iterable, List, Set
 import xml.etree.ElementTree as ET
 import json
-from datetime import datetime, time, timedelta
-import time as pytime
+from datetime import datetime, timedelta
 import re
 import os
 import logging
 import sys
-
-from src.utils import progress_context, _fmt_duration
 
 
 def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = True, 
@@ -142,7 +139,8 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
     #################################### parentId ####################################################################
 
-        #################################### parentId ####################################################################
+        part_of_reference = record.find("Part_of/part_of_reference")
+        part_of_reference = part_of_reference.text if part_of_reference is not None else None
 
         parentId = "A13530124"  # Fond level value
 
@@ -177,11 +175,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         if arrangement == "":
             arrangement = None
 
-            arrangement = arrangement_system+' '+client_filepath
-            arrangement = arrangement.strip()
-            
-            if arrangement == "":
-                arrangement = None
+    #####################################################################################################################
 
         #batchId ---> not used
 
@@ -283,24 +277,17 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                 closureType = 'U'
             else:
                 closureType = None
-                
-                if closureStatus == 'D':
-                    closureType = 'U'
-                else:
-                    closureType = None
 
-                if closureStatus == 'D' and heldBy_information == "UK Parliament":
-                    closureStatus = 'U'
-                    closureCode = None
-                    closureType = None
-
-            if catalogueLevel <= 8:
-                closureStatus = None
+            if closureStatus == 'D' and heldBy_information == "UK Parliament":
+                closureStatus = 'U'
                 closureCode = None
                 closureType = None
 
+        if catalogueLevel <= 8:
+            closureStatus = None
+            closureCode = None
+            closureType = None
 
-        ################### recordOpeningDate #######################################################
 
     ################### recordOpeningDate #######################################################
 
@@ -309,10 +296,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
             recordOpeningDate = record.find("closed_until")
             recordOpeningDate = recordOpeningDate.text if recordOpeningDate is not None else None
 
-                if record.find("access_status/value[@lang='neutral']").text == 'CLOSED' and heldBy_information == "UK Parliament":
-                    recordOpeningDate = None
-                    
-            if catalogueLevel <= 8:
+            if record.find("access_status/value[@lang='neutral']").text == 'CLOSED' and heldBy_information == "UK Parliament":
                 recordOpeningDate = None
 
         if catalogueLevel <= 8:
@@ -330,10 +314,10 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
         # corporateNames -- not used
 
-        ################### copiesInformation #######################################################
+    ################### copiesInformation #######################################################
 
-            copiesInformation_description = record.find("existence_of_copies")
-            copiesInformation_description = copiesInformation_description.text if copiesInformation_description is not None else None
+        copiesInformation_description = record.find("existence_of_copies")
+        copiesInformation_description = copiesInformation_description.text if copiesInformation_description is not None else None
 
         copiesInformation = []
         if copiesInformation_description is not None:
@@ -462,37 +446,41 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
     #############################################################################################
 
-            language = record.find("Inscription//inscription.language")
-            language = language.text if language is not None else None
+        language = record.find("Inscription//inscription.language")
+        language = language.text if language is not None else None
 
-            legalStatus = record.find("legal_status/value[@lang='0']")
-            legalStatus = legalStatus.text if legalStatus is not None else None
+        legalStatus = record.find("legal_status/value[@lang='0']")
+        legalStatus = legalStatus.text if legalStatus is not None else None
 
         #links -- not used
 
     ################################# existence_of_originals #######################################
 
-            locationOfOriginals_xReferenceDescription = record.find("existence_of_originals")
-            locationOfOriginals_xReferenceDescription = locationOfOriginals_xReferenceDescription.text if locationOfOriginals_xReferenceDescription is not None else None
+        locationOfOriginals_xReferenceDescription = record.find("existence_of_originals")
+        locationOfOriginals_xReferenceDescription = locationOfOriginals_xReferenceDescription.text if locationOfOriginals_xReferenceDescription is not None else None
 
-            locationOfOriginals = []
+        locationOfOriginals = []
 
-            if locationOfOriginals_xReferenceDescription is not None:
-                locationOfOriginals = [
-                {
-                "xReferenceName": None,
-                "xReferenceDescription": locationOfOriginals_xReferenceDescription
-                }
-        ]
-            else:
-                locationOfOriginals = [
+        if locationOfOriginals_xReferenceDescription is not None:
+            locationOfOriginals = [
             {
             "xReferenceName": None,
-            "xReferenceDescription": None
+            "xReferenceDescription": locationOfOriginals_xReferenceDescription
             }
-        ]
+    ]
+        else:
+            locationOfOriginals = [
+        {
+        "xReferenceName": None,
+        "xReferenceDescription": None
+        }
+    ]
 
-        ######################################################################################################################################################################
+    ######################################################################################################################################################################
+
+        # "mapDesignation" -- not used
+        # "mapScaleNumber" -- not used
+        # note -- not used
 
     ################################# people - NOT USED #######################################
 
@@ -512,45 +500,32 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
     #    }
     #  ]
 
-            
-        #    people  = []
-        #    people =  [
-        #    {
-        #      "preTitle": None,
-        #      "title": None,
-        #      "forenames": [
-        #       None
-        #      ],
-        #      "surname": None,
-        #      "dateOfBirth": None,
-        #      "dateOfDeath": None
-        #    }
-        #  ]
-
-        ######################################## physicalDescriptionExtent and physicalDescriptionForm ########################################################################################################
+    ######################################## physicalDescriptionExtent and physicalDescriptionForm ########################################################################################################
 
 
-            extent_descriptions = []
+        extent_descriptions = []
 
-            for extent in record.findall('Extent'):
-                value_elem = extent.find("extent.value")
-                form_elem = extent.find("extent.form")
+        for extent in record.findall('Extent'):
+            value_elem = extent.find("extent.value")
+            form_elem = extent.find("extent.form")
 
-                value_text = value_elem.text.strip() if value_elem is not None and value_elem.text else ""
-                form_text = form_elem.text.strip() if form_elem is not None and form_elem.text else ""
+            value_text = value_elem.text.strip() if value_elem is not None and value_elem.text else ""
+            form_text = form_elem.text.strip() if form_elem is not None and form_elem.text else ""
 
-                if value_text or form_text:
-                    extent_descriptions.append((value_text, form_text))
+            if value_text or form_text:
+                extent_descriptions.append((value_text, form_text))
 
-            physicalDescriptionExtent = extent_descriptions[0][0] if extent_descriptions else None
+        physicalDescriptionExtent = extent_descriptions[0][0] if extent_descriptions else None
 
-            physicalDescriptionForm = []
-            if extent_descriptions:
-                first_form = extent_descriptions[0][1]
-                if first_form:
-                    physicalDescriptionForm.append(f" {first_form}")
-                for value, form in extent_descriptions[1:]:
-                    physicalDescriptionForm.append(f"{value} {form}".strip())
+        physicalDescriptionForm = []
+        if extent_descriptions:
+            first_form = extent_descriptions[0][1]
+            if first_form:
+                physicalDescriptionForm.append(f" {first_form}")
+            for value, form in extent_descriptions[1:]:
+                physicalDescriptionForm.append(f"{value} {form}".strip())
+
+        physicalDescriptionForm = '; '.join(physicalDescriptionForm) if physicalDescriptionForm else None
 
     ################################# places - NOT USED #############################################################################################
 
@@ -616,30 +591,17 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         }
     ]
 
-        ################################ publicationNote ###########################################################
-                
-                
-            relatedMaterial_description = record.find("related_material.free_text")
-            relatedMaterial_description = relatedMaterial_description.text if relatedMaterial_description is not None else None
+    ################################# separatedMaterial ##############################################################
 
-            if relatedMaterial_description is not None:
-                relatedMaterial = []
-                relatedMaterial = [
-            {
-            "xReferenceId": None,
-            "description":  relatedMaterial_description
-            }
-        ]
-            elif relatedMaterial_description is None:
-                relatedMaterial = []
-                relatedMaterial = [
-            {
-            "xReferenceId": None,
-            "description":  None
-            }
-        ]
+        separatedMaterial = []
+        separatedMaterial = [
+        {
+        "xReferenceId": None,
+        "description": None
+        }
+    ]
 
-        ################################# separatedMaterial ##############################################################
+    ###################################################################################################################
 
 
         #registryRecords -- not used and not in JSON template
@@ -647,90 +609,82 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         #restrictionsOnUse = record.find("copyright_note")
         #restrictionsOnUse = restrictionsOnUse.text if restrictionsOnUse is not None else None
 
-        ###################################################################################################################
 
-            
-            #registryRecords -- not used and not in JSON template
-            
-            #restrictionsOnUse = record.find("copyright_note")
-            #restrictionsOnUse = restrictionsOnUse.text if restrictionsOnUse is not None else None
+    ##################################### scopeContent ##################################################################
 
+        scopeContent_description = record.find("Content_description/content.description")
+        scopeContent_description = scopeContent_description.text if scopeContent_description is not None else None
 
-        ##################################### scopeContent ##################################################################
-
-            scopeContent_description = record.find("Content_description/content.description")
-            scopeContent_description = scopeContent_description.text if scopeContent_description is not None else None
-
-            if scopeContent_description is not None:
-                scopeContent = []
-                scopeContent = {
-                "personNames": [
-                {
-                "firstName": None,
-                "surname": None,
-                #"startDate": None,
-                #"endDate": None
-            }
-            ],
-            "placeNames": [
+        if scopeContent_description is not None:
+            scopeContent = []
+            scopeContent = {
+            "personNames": [
             {
-                "xReferenceName": None
-            }
-            ],
-            "refferedToDate": None,
-            "organizations": [
-            {
-                "xReferenceName": None
-            }
-            ],
-            "description": scopeContent_description,
-            "ephemera": None,
-            "occupations": None,
-            "schema": None
+            "firstName": None,
+            "surname": None,
+            #"startDate": None,
+            #"endDate": None
         }
-
-            elif scopeContent_description is None:
-                scopeContent = []
-                scopeContent = {
-                "personNames": [
-                {
-                "firstName": None,
-                "surname": None,
-                #"startDate": None,
-                #"endDate": None
-            }
-            ],
-            "placeNames": [
-            {
-                "xReferenceName": None
-            }
-            ],
-            "refferedToDate": None,
-            "organizations": [
-            {
-                "xReferenceName": None
-            }
-            ],
-            "description": None,
-            "ephemera": None,
-            "occupations": None,
-            "schema": None
+        ],
+        "placeNames": [
+        {
+            "xReferenceName": None
         }
+        ],
+        "refferedToDate": None,
+        "organizations": [
+        {
+            "xReferenceName": None
+        }
+        ],
+        "description": scopeContent_description,
+        "ephemera": None,
+        "occupations": None,
+        "schema": None
+    }
 
-        ########################################################################################################
+        elif scopeContent_description is None:
+            scopeContent = []
+            scopeContent = {
+            "personNames": [
+            {
+            "firstName": None,
+            "surname": None,
+            #"startDate": None,
+            #"endDate": None
+        }
+        ],
+        "placeNames": [
+        {
+            "xReferenceName": None
+        }
+        ],
+        "refferedToDate": None,
+        "organizations": [
+        {
+            "xReferenceName": None
+        }
+        ],
+        "description": None,
+        "ephemera": None,
+        "occupations": None,
+        "schema": None
+    }
 
-            #sortKey: generated automatically with ingest into MongoDB. Does not to have be included in JSON.
+    ########################################################################################################
 
-            #source ---> hard coded value "PA"
+        #sortKey: generated automatically with ingest into MongoDB. Does not to have be included in JSON.
 
-            #subjects --> will not be used
+        #source ---> hard coded value "PA"
 
-        ################################# subjects ##############################################################
+        #subjects --> will not be used
 
-            subjects = []
-            subjects = [
-                None
-        ]
+    ################################# subjects ##############################################################
+
+        subjects = []
+        subjects = [
+            None
+    ]
 
     ###################################################################################################################
 
@@ -814,6 +768,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                         "title": title,
                         "unpublishedFindingAids": unpublishedFindingAids
                         }
+                    }
 
         #### JSON mapping for all other types of records
         else:
@@ -928,6 +883,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
         _records_processed += 1
         print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
         sys.stdout.flush()
+
+    print(f"{len(records)} records processed from the XML file.")
+    return records
 
 
 class NewlineToPTransformer():
