@@ -98,8 +98,9 @@ def lambda_handler(event, context):
 
     # Validate key exists and is an XML file
     if not key or not key.endswith(".xml"):
-        logger.error("Invalid or missing file key in event: key=%s", key)
-        return {"status": "error", "message": "Invalid or missing XML file key in event"}
+        result = {"status": "error", "message": "Invalid or missing XML file key in event"}
+        logger.info("Pipeline result: %s", json.dumps(result))
+        return result
 
     # S3 output prefix (key prefix for uploads). Alias output_dir for legacy variable usage below.
     output_prefix = os.environ.get('S3_OUTPUT_DIR', 'json_outputs').strip().strip('/')
@@ -109,21 +110,24 @@ def lambda_handler(event, context):
     transfer_register = None
     if run_mode in ["local_s3", "remote_s3"]:
         if not transfer_register_filename:
-            logger.error("TRANSFER_REGISTER_FILENAME environment variable is not set")
-            return {
+            result = {
                 "status": "error",
                 "message": "TRANSFER_REGISTER_FILENAME environment variable is required"
             }
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
         try:
             transfer_register = load_transfer_register(transfer_register_filename, s3, bucket, output_prefix, logger)
             num_existing = len(transfer_register.get('records', {}))
             logger.info("Loaded transfer register with %d existing records", num_existing)
         except Exception as e:
             logger.exception("FATAL: Failed to load transfer register - cannot proceed without deduplication")
-            return {
+            result = {
                 "status": "error",
                 "message": f"Failed to load deduplication transfer register: {str(e)}"
             }
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
     else:
         transfer_register = None
         logger.info("Running in local mode - skipping transfer register/deduplication")
@@ -172,15 +176,21 @@ def lambda_handler(event, context):
             err = e.response.get('Error', {})
             code = err.get('Code')
             if code in ("404", "NoSuchKey"):
-                logger.error("S3 key not found: s3://%s/%s", bucket, raw_key)
-                return {"status": "error", "message": f"S3 key not found: s3://{bucket}/{raw_key}"}
-            return {"status": "error", "message": f"S3 download failed ({code}) for {raw_key}"}
+                result = {"status": "error", "message": f"S3 key not found: s3://{bucket}/{raw_key}"}
+                logger.info("Pipeline result: %s", json.dumps(result))
+                return result
+            result = {"status": "error", "message": f"S3 download failed ({code}) for {raw_key}"}
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
         except Exception as e:
             logger.exception("Unexpected S3 download error")
-            return {"status": "error", "message": f"Unexpected download error for {raw_key}: {e}"}
+            result = {"status": "error", "message": f"Unexpected download error for {raw_key}: {e}"}
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
         if not tmp_path.exists() or tmp_path.stat().st_size == 0:
-            logger.error("Downloaded file missing or empty: %s", tmp_path)
-            return {"status": "error", "message": f"Downloaded file missing or empty: {tmp_path}"}
+            result = {"status": "error", "message": f"Downloaded file missing or empty: {tmp_path}"}
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
         xml_path_to_convert = tmp_path
         logger.info("Downloaded OK (%d bytes)", tmp_path.stat().st_size)
     else:
@@ -189,8 +199,9 @@ def lambda_handler(event, context):
         if not local_candidate.is_absolute():
             local_candidate = repo_root / key
         if not local_candidate.exists():
-            logger.error("Local XML file not found: %s", local_candidate)
-            return {"status": "error", "message": f"Local XML file not found: {local_candidate}"}
+            result = {"status": "error", "message": f"Local XML file not found: {local_candidate}"}
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
         # use local XML file instead
         xml_path_to_convert = local_candidate
         logger.info("Using local XML file: %s", xml_path_to_convert)
@@ -213,8 +224,9 @@ def lambda_handler(event, context):
             xml_path_to_convert = filter_xml_by_iaid(xml_path_to_convert, filter_iaid, filtered_xml_path, logger)
             logger.info("Filtered XML path: %s", xml_path_to_convert)
         except ValueError as e:
-            logger.error("Failed to filter XML: %s", e)
-            return {"status": "error", "message": str(e)}
+            result = {"status": "error", "message": str(e)}
+            logger.info("Pipeline result: %s", json.dumps(result))
+            return result
     
     # 2. Convert XML to JSON
     try:
@@ -230,7 +242,9 @@ def lambda_handler(event, context):
                 logger.info("Dedupe proc removed %d records; %d remain", removed, len(records))
     except Exception:
         logger.exception("Conversion failed")
-        return {"status": "error", "message": f"Conversion failed for {xml_path_to_convert.name}"}
+        result = {"status": "error", "message": f"Conversion failed for {xml_path_to_convert.name}"}
+        logger.info("Pipeline result: %s", json.dumps(result))
+        return result
     finally:
         if tmp_path and tmp_path.exists() and run_mode in ["local_s3", "remote_s3"]:
             try:
@@ -254,7 +268,18 @@ def lambda_handler(event, context):
 
     # 4. Apply transformations if we have JSON data
     if converted_xml_to_json_files:
+        
+        # keep track of successfully transformed files and closure status
         successfully_transformed_files = []
+        open_count = 0
+        closure_status_dict = {
+            'open': open_count,
+            'held_at_parliament': [],
+            'closed_TNA': []
+        }
+
+        replica_iaids_added = []
+
         # Collect transformed JSONs by level (in memory)
         jsons_by_level = {}  # {level_name: [(filename, json_dict), ...]}
 
@@ -265,10 +290,9 @@ def lambda_handler(event, context):
                 # set up transformation config
                 record_level_mapping = transformation_config.get("record_level_mapping", {})
                 if len(transformation_config) == 0 or len(record_level_mapping) == 0:
-                    logger.error("transformation_config: %s", transformation_config)
-                    logger.error("record_level_mapping: %s", record_level_mapping)
-                    return {"status": "error", "message": "Transformation config or record "
-                                                            "level mapping is missing or empty"}
+                    result = {"status": "error", "message": "Transformation config or record level mapping is missing or empty"}
+                    logger.info("Pipeline result: %s", json.dumps(result))
+                    return result
 
                 # do the transformations
                 try:
@@ -305,11 +329,11 @@ def lambda_handler(event, context):
 
                         # now process replica metadata if available
                         if filename in replica_files:
-                            print(f"Processing replica metadata for file: {filename}", end='\r')
                             rtd = ReplicaDataTransformer(bucket_name=bucket,
                                                             prefix=replica_prefix,
                                                             s3_client=s3 if run_mode in ["local_s3", "remote_s3"] else None)
                             transformed_json = rtd.transform(transformed_json)
+                            replica_iaids_added.append(filename)
                     
                     # Save post-transformation JSON (after all transformers)
                     if save_intermediates and run_mode == "local":
@@ -338,11 +362,40 @@ def lambda_handler(event, context):
                 except Exception:
                     logger.exception("Error applying transformations for file %s",
                                      f"{filename}.json")
-                    return {"status": "error", "message": f"Error applying "
-                            f"transformations for {filename}.json"}
+                    result = {"status": "error", "message": f"Error applying transformations for {filename}.json"}
+                    logger.info("Pipeline result: %s", json.dumps(result))
+                    return result
                 successfully_transformed_files.append(filename)
 
+                # build list of counts of closureStatus' if needed
+                if transformed_json["record"].get("closureStatus"):
+                    # logic is:
+                    # if closureType = 'O' then it is open
+                    # if closureStatus = 'U' then it is held by Parliament (whether they are open or closed)
+                    # if closureStatus = 'D' and closureType = 'U' then it is closed to TNA
+
+                    # get the closure status
+                    cl_status = transformed_json["record"]["closureStatus"]
+                    # get closure type for additional tna closed check
+                    closure_type = transformed_json["record"].get("closureType")
+                    is_held_pa = cl_status == 'U'
+                    is_tna_closed = cl_status == 'D' and closure_type == 'U'
+                    # if Open, increment count instead of appending filename
+                    if cl_status == 'O':
+                            closure_status_dict['open'] += 1
+                    elif is_held_pa:
+                        closure_status_dict['held_at_parliament'].append(filename)
+                    elif is_tna_closed:
+                        closure_status_dict['closed_TNA'].append(filename)
+                    else:
+                        raise ValueError(f"Unknown closureStatus '{cl_status}' in record {filename}")
                 tick(i)
+
+    payload = closure_status_dict
+    logger.info(f"Closure Status Summary: {json.dumps(payload, indent=2)}")
+
+    payload = replica_iaids_added
+    logger.info(f"Replica IAIDs added: {json.dumps(payload, indent=2)}")
 
     # Create in-memory tarballs for each level
     if jsons_by_level and run_mode in ['local_s3', 'remote_s3']:
@@ -384,15 +437,17 @@ def lambda_handler(event, context):
 
                 except Exception:
                     logger.exception("Error creating tarball for level %s", level_name)
-                    return {"status": "error", "message": f"Error creating tarball "
-                            f"for level {level_name}"}
+                    result = {"status": "error", "message": f"Error creating tarball for level {level_name}"}
+                    logger.info("Pipeline result: %s", json.dumps(result))
+                    return result
 
             # Upload to S3 in S3 modes (local_s3 or remote_s3)
             # we need to create a super-tarball containing all level tarballs
             if run_mode in ["local_s3", "remote_s3"]:
                 if not bucket:
-                    logger.error("No S3 bucket specified for upload")
-                    return {"status": "error", "message": "No S3 bucket specified"}
+                    result = {"status": "error", "message": "No S3 bucket specified"}
+                    logger.info("Pipeline result: %s", json.dumps(result))
+                    return result
 
                 super_tarball_name = f"{tree_name}.tar.gz"
                 logger.info("Creating super-tarball: %s with %d level tarballs",
@@ -434,9 +489,10 @@ def lambda_handler(event, context):
                 except ClientError as e:
                     logger.exception("Error uploading tarball to S3: %s",
                                     e.response.get('Error', {}).get('Code'))
-                    return {"status": "error",
-                            "message": f"Error uploading super-tarball to S3:"
-                                f" {e.response.get('Error', {}).get('Code')}"}
+                    result = {"status": "error",
+                            "message": f"Error uploading super-tarball to S3: {e.response.get('Error', {}).get('Code')}"}
+                    logger.info("Pipeline result: %s", json.dumps(result))
+                    return result
 
 
 
@@ -445,13 +501,13 @@ def lambda_handler(event, context):
         duration = (end_time - start_time).total_seconds()
         h, rem = divmod(duration, 3600)
         m, s = divmod(rem, 60)
-        logger.info("Processed %s successfully from %s to %s "
-        "(Duration: %02d:%02d:%02d)", key, start_time, end_time, int(h), int(m), int(s))
-        return {"status": "ok", "message": f"Processed {key} successfully "
-                f" (Duration: {int(h):02d}:{int(m):02d}:{int(s):02d})"}
+        result = {"status": "ok", "message": f"Processed {key} successfully (Duration: {int(h):02d}:{int(m):02d}:{int(s):02d})"}
+        logger.info("Pipeline result: %s", json.dumps(result))
+        return result
     else:
-        logger.error("No transformed JSON generated for %s", key)
-        return {"status": "error", "message": f"No transformed JSON generated for {key}"}
+        result = {"status": "error", "message": f"No transformed JSON generated for {key}"}
+        logger.info("Pipeline result: %s", json.dumps(result))
+        return result
 
 # Run the handler locally if in local or local_s3 mode
 if run_mode in ["local", "local_s3"]:
