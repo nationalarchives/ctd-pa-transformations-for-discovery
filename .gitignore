@@ -18,3 +18,4 @@ json_outputs/
 
 notebooks/*
 !notebooks/testing_*.ipynb
+notebooks/testing_marco.ipynb
