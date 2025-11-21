@@ -691,82 +691,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
     ########################################## storing XML values in JSON dictionary ###########################################
 
-        ##### Temporarly remove closure information for UK Parliament records that are closed (U status)
-
-        # if Jenny asks send U closure status for UK Parliament records to Discovery then deactive this IF statement (Discovery can handle U status)
-
-        if heldBy_information == "UK Parliament" and closureStatus == 'U':
-            mask_closure_status = True
-        else:
-            mask_closure_status = False
-
-        if mask_closure_status:
-            record_data = { "record": {
-                            #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
-                            "iaid": iaid,
-                        #"replicaId": None,
-                        "citableReference": citableReference,
-                        "parentId": parentId,
-                        #"accumulationDates": None,
-                        "accruals": accruals,
-                        "accessConditions": accessConditions,
-                        "administrativeBackground": administrativeBackground,
-                        #"appraisalInformation": appraisalInformation,
-                        "arrangement": arrangement, #arrangement_system+' '+client_filepath,
-                        #"batchId": None,
-                        #"refIaid": None,
-                        "catalogueId": catalogueId,
-                        "catalogueLevel": catalogueLevel,
-                        "coveringFromDate": coveringFromDate,
-                        "coveringToDate": coveringToDate,
-                        "chargeType": chargeType,
-                        #"eDocumentId": None,
-                        "coveringDates": coveringDates,
-                        "custodialHistory": custodialHistory,
-                        #"closureCode": closureCode,
-                        #"closureStatus": closureStatus,
-                        #"closureType": closureType,
-                        #"recordOpeningDate": recordOpeningDate,
-                        #"corporateNames": None,
-                        "copiesInformation": copiesInformation,
-                        "creatorName": creatorName,
-                        "digitised": digitised,
-                        #"dimensions": None,
-                        "formerReferenceDep": formerReferenceDep,
-                        "formerReferencePro": formerReferencePro,
-                        "heldBy": heldBy,
-                        #"immediateSourceOfAcquisition": immediateSourceOfAcquisition,
-                        "language": language,
-                        "legalStatus": legalStatus,
-                        #"links": None,
-                        "locationOfOriginals": locationOfOriginals,
-                        #"mapDesignation": None,
-                        #"mapScaleNumber": None,
-                        #"note": None,
-                        #"people": people,
-                        #"physicalCondition": physicalCondition,
-                        "physicalDescriptionExtent": physicalDescriptionExtent,
-                        "physicalDescriptionForm": physicalDescriptionForm,
-                        #"places": places,
-                        "referencePart": referencePart,
-                        "publicationNote": publicationNote,
-                        "relatedMaterial": relatedMaterial,
-                        "separatedMaterial": separatedMaterial,
-                        #"restrictionsOnUse": restrictionsOnUse,
-                        "scopeContent": scopeContent,
-                        #"sortKey": None,
-                        "source": "PA",
-                        #"subjects": subjects,
-                        "title": title,
-                        "unpublishedFindingAids": unpublishedFindingAids
-                        }
-                    }
-
-        #### JSON mapping for all other types of records
-        else:
-            record_data = { "record": {
-                            #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
-                            "iaid": iaid,
+        record_data = { "record": {
+                        #"$schema": "./PA_JSON_Schema.json",  # for schema validation in Visual Studio
+                        "iaid": iaid,
                         #"replicaId": None,
                         "citableReference": citableReference,
                         "parentId": parentId,
