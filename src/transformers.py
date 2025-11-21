@@ -278,7 +278,8 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
             else:
                 closureType = None
 
-            if closureStatus == 'D' and heldBy_information == "UK Parliament":
+            #if closureStatus == 'D' and heldBy_information == "UK Parliament":
+            if heldBy_information == "UK Parliament": # temp all UK Parliament to U status
                 closureStatus = 'U'
                 closureCode = None
                 closureType = None
