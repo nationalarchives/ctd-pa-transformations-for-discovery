@@ -1,4 +1,3 @@
-from asyncio.log import logger
 import boto3
 import sys
 import json
@@ -8,10 +7,10 @@ import tempfile
 from pathlib import Path
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
-from typing import Optional
 from datetime import datetime
 import time
-import json, tarfile, io
+import tarfile
+import io
 
 repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
@@ -43,6 +42,12 @@ if run_mode not in VALID_RUN_MODES:
         f"Invalid RUN_MODE '{run_mode}'. Must be one of: {', '.join(VALID_RUN_MODES)}"
     )
 
+# Configure module logger (level can be set with CTD_LOG_LEVEL env var)
+_log_level = os.getenv("CTD_LOG_LEVEL", "DEBUG").upper()
+_numeric_level = getattr(logging, _log_level, logging.INFO)
+logging.basicConfig(level=_numeric_level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
+logger = logging.getLogger(__name__)
+
 # S3 client configuration based on run mode
 if run_mode == "local_s3":
     # Local development with S3: requires AWS profile
@@ -60,12 +65,6 @@ else:
     # local mode: no S3 client needed
     s3 = None
     logger.info("Running in local mode (no S3)")
-
-# Configure module logger (level can be set with CTD_LOG_LEVEL env var)
-_log_level = os.getenv("CTD_LOG_LEVEL", "DEBUG").upper()
-_numeric_level = getattr(logging, _log_level, logging.INFO)
-logging.basicConfig(level=_numeric_level, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
-logger = logging.getLogger(__name__)
 
 # Set up file handler if running in local modes
 if run_mode in ["local", "local_s3"]:
@@ -392,10 +391,10 @@ def lambda_handler(event, context):
                 tick(i)
 
     payload = closure_status_dict
-    logger.info(f"Closure Status Summary: {json.dumps(payload, indent=2)}")
+    logger.info("Closure Status Summary: %s", json.dumps(payload, indent=2))
 
     payload = replica_iaids_added
-    logger.info(f"Replica IAIDs added: {json.dumps(payload, indent=2)}")
+    logger.info("Replica IAIDs added: %s", json.dumps(payload, indent=2))
 
     # Create in-memory tarballs for each level
     if jsons_by_level and run_mode in ['local_s3', 'remote_s3']:

@@ -21,27 +21,7 @@ import json
 import time as pytime
 from collections import OrderedDict
 
-def set_project_root(marker: str = "README.md") -> str:
-    """
-    Set the working directory to the project root by searching for a marker file.
-    Usage:
-        import utils
-        utils.set_project_root()
-    """
-    start_dir = os.getcwd()
-    current = start_dir
-    while True:
-        if os.path.exists(os.path.join(current, marker)):
-            os.chdir(current)
-            print(f"Set working directory to project root: {current}")
-            return current
-        parent = os.path.dirname(current)
-        if parent == current:
-            raise FileNotFoundError(f"Could not find {marker} in any parent directory.")
-        current = parent
 
-
-# Helper to find nested key values
 def find_key(obj, target):
     if isinstance(obj, dict):
         for k, v in obj.items():
