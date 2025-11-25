@@ -9,6 +9,7 @@ scripts/
 trigger.json
 *.env
 *.pyc
+*.zip
 
 /logs/
 
@@ -19,3 +20,4 @@ json_outputs/
 notebooks/*
 !notebooks/testing_*.ipynb
 notebooks/testing_marco.ipynb
+ctd-pa-transformations-for-discovery.code-workspace
