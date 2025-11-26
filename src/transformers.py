@@ -697,8 +697,9 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
 
         # update diagnostics
         _records_processed += 1
-        print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
-        sys.stdout.flush()
+        if progress_verbose:
+            print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
+            sys.stdout.flush()
 
     print(f"{len(records)} records processed from the XML file.")
     return records
