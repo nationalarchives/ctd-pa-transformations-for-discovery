@@ -88,6 +88,13 @@ def lambda_handler(event, context):
     # log when process was started
     start_time = datetime.now()
     logger.info("Lambda handler started at %s", start_time.isoformat())
+    
+    # Log Lambda context information if running in remote_s3 mode
+    if run_mode == "remote_s3" and context:
+        logger.info("Function: %s, Version: %s, Request ID: %s",
+                    context.function_name, context.function_version, context.aws_request_id)
+        logger.info("Memory limit: %s MB, Timeout in: %.1f seconds",
+                    context.memory_limit_in_mb, context.get_remaining_time_in_millis() / 1000)
 
     # 1. Get bucket and key from event
     record = event['Records'][0]
@@ -101,8 +108,25 @@ def lambda_handler(event, context):
         logger.info("Pipeline result: %s", json.dumps(result))
         return result
 
+    # Check if we're in test mode and apply test folder prefix
+    test_mode = os.getenv("TEST_MODE", "false").strip().lower() in ("1", "true", "yes", "y")
+    test_folder = os.getenv("S3_TEST_FOLDER", "").strip().strip('/')
+    
+    if test_mode and test_folder:
+        logger.info("TEST_MODE enabled: using test folder '%s'", test_folder)
+        # Prepend test folder to input key if not already present
+        if not key.startswith(f"{test_folder}/"):
+            key = f"{test_folder}/{key}"
+            logger.info("Adjusted input key for test mode: %s", key)
+    
     # S3 output prefix (key prefix for uploads). Alias output_dir for legacy variable usage below.
     output_prefix = os.environ.get('S3_OUTPUT_DIR', 'json_outputs').strip().strip('/')
+    
+    # Apply test folder prefix to output if in test mode
+    if test_mode and test_folder:
+        output_prefix = f"{test_folder}/{output_prefix}"
+        logger.info("Adjusted output prefix for test mode: %s", output_prefix)
+    
     output_dir = output_prefix  # backward compatibility for existing code paths
     
     # Load transfer register for deduplication (only in S3 modes)
@@ -154,6 +178,12 @@ def lambda_handler(event, context):
 
     # filter iaid list for replica metadata to those in bucket before applying replica transformer
     replica_prefix = os.getenv("REPLICA_METADATA_PREFIX", "metadata")
+    
+    # Apply test folder prefix to replica metadata if in test mode
+    if test_mode and test_folder:
+        replica_prefix = f"{test_folder}/{replica_prefix}"
+        logger.info("Adjusted replica prefix for test mode: %s", replica_prefix)
+    
     paginator = s3.get_paginator('list_objects_v2')
     operation_parameters = {'Bucket': bucket,
                             'Prefix': replica_prefix}
@@ -283,8 +313,19 @@ def lambda_handler(event, context):
         jsons_by_level = {}  # {level_name: [(filename, json_dict), ...]}
 
         logger.info("Applying transformations to %d JSON files...", len(converted_xml_to_json_files))
-        with progress_context(total = len(converted_xml_to_json_files), interval=100) as tick:
+        with progress_context(total = len(converted_xml_to_json_files), interval=100, label="Transforming") as tick:
             for i, (filename, _file) in enumerate(converted_xml_to_json_files.items(), start=1):
+                
+                # Check timeout in remote_s3 mode periodically
+                if run_mode == "remote_s3" and context and i % 100 == 0:
+                    remaining_ms = context.get_remaining_time_in_millis()
+                    if remaining_ms < 60000:  # Less than 60 seconds remaining
+                        logger.warning("Running low on time (%d ms remaining) at record %d/%d",
+                                     remaining_ms, i, len(converted_xml_to_json_files))
+                        if remaining_ms < 30000:  # Less than 30 seconds - abort
+                            result = {"status": "error", "message": f"Lambda timeout approaching - processed {i}/{len(converted_xml_to_json_files)} records"}
+                            logger.info("Pipeline result: %s", json.dumps(result))
+                            return result
 
                 # set up transformation config
                 record_level_mapping = transformation_config.get("record_level_mapping", {})

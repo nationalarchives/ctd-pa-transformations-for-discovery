@@ -77,9 +77,12 @@ def log_timing(operation_name: str, logger: Optional[logging.Logger] = None):
 
 
 @contextlib.contextmanager
-def progress_context(total: int, interval: int = 500, label: Optional[str] = "Processing"):
+def progress_context(total: int, interval: int = 500,
+                    label: Optional[str] = "Processing",
+                    verbose: bool = False):
     start = pytime.time()
     total = max(total, 0)
+    
     def _format_line(done: int, elapsed: float) -> str:
         if total == 0:
             return f"[{label}] 0/0 (0%)"
@@ -89,18 +92,27 @@ def progress_context(total: int, interval: int = 500, label: Optional[str] = "Pr
         eta_str = (datetime.now() + timedelta(seconds=eta_secs)).strftime("%H:%M")
         return (f"{label} [{done}/{total}] ({done/total*100:.0f}%) | "
                 f"Rate: {rate:.0f}/min | ETA ~ {eta_str}    ")
+    
     def tick(done: int):
+        if not verbose:
+            return
         if done == total:
             return
         if done and interval and (done % interval == 0):
             elapsed = pytime.time() - start
             print(_format_line(done, elapsed), end='\r')
+    
     try:
         yield tick
     finally:
         elapsed = pytime.time() - start
-        print(_format_line(total, elapsed))
-        print()
+        if verbose:
+            print(_format_line(total, elapsed))
+            print()
+        else:
+            # Only print rate summary when not in verbose mode
+            rate = (total / elapsed) * 60.0 if elapsed > 0 and total else 0.0
+            print(f"{label} complete: {total} items | Rate: {rate:.0f}/min")
 
 
 # helper to format duration
