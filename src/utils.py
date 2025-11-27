@@ -4,6 +4,7 @@ Includes:
  - Project root resolution
  - Generic JSON key finder
  - XML merge helpers (merge multiple trigger XML files into one)
+ - SSM Parameter Store configuration retrieval
 """
 
 from __future__ import annotations
@@ -20,6 +21,55 @@ from datetime import datetime, timedelta
 import json
 import time as pytime
 from collections import OrderedDict
+
+
+def get_trans_config(logger: Optional[logging.Logger] = None):
+    """Get TRANS_CONFIG from SSM Parameter Store or environment variable.
+    
+    Tries in this order:
+    1. SSM Parameter Store /ctd-pa/TRANS_CONFIG (for Lambda and local with AWS credentials)
+    2. Environment variable TRANS_CONFIG (fallback for local development)
+    3. Returns empty dict if neither found
+    
+    Parameters
+    ----------
+    logger : logging.Logger | None
+        Logger instance to use. If None, uses root logger.
+    
+    Returns
+    -------
+    dict
+        Transformation configuration dictionary
+    """
+    if logger is None:
+        logger = logging.getLogger(__name__)
+    
+    # Try SSM Parameter Store first (works in Lambda and local with AWS profile)
+    try:
+        import boto3
+        ssm = boto3.client('ssm', region_name=os.getenv('AWS_REGION', 'eu-west-2'))
+        response = ssm.get_parameter(Name='/ctd-pa/TRANS_CONFIG')
+        config = json.loads(response['Parameter']['Value'])
+        logger.info("Loaded TRANS_CONFIG from SSM Parameter Store")
+        return config
+    except Exception as e:
+        logger.debug("Could not retrieve TRANS_CONFIG from SSM Parameter Store: %s", e)
+    
+    # Fallback to environment variable (for local development without AWS)
+    env_value = os.getenv("TRANS_CONFIG")
+    if env_value:
+        try:
+            config = json.loads(env_value)
+            logger.info("Loaded TRANS_CONFIG from environment variable (fallback)")
+            return config
+        except json.JSONDecodeError as e:
+            logger.error("Failed to parse TRANS_CONFIG from environment: %s", e)
+            return {}
+    
+    # No configuration found
+    logger.warning("TRANS_CONFIG not found in SSM Parameter Store or environment variables")
+    logger.info("Using empty TRANS_CONFIG - transformations may not work correctly")
+    return {}
 
 
 def find_key(obj, target):

@@ -18,7 +18,7 @@ sys.path.insert(0, str(repo_root))
 from src.config_loader import UniversalConfig
 from src.utils import find_key, merge_xml_files, log_timing, _load_json_file, filter_xml_by_iaid
 from src.utils import load_transfer_register, save_transfer_register, filter_new_records, update_transfer_register_with_records
-from src.utils import insert_ordered, progress_context
+from src.utils import insert_ordered, progress_context, get_trans_config
 from src.transformers import NewlineToPTransformer, YNamingTransformer, ReplicaDataTransformer, convert_to_json
 
 
@@ -76,9 +76,8 @@ if run_mode in ["local", "local_s3"]:
     logger.addHandler(file_handler)
 
 
-# define pipeline configuration separately from event
-transformations_str = os.environ.get("TRANS_CONFIG")
-transformation_config = _load_json_file(transformations_str, logger=logger)
+# Load transformation configuration from SSM Parameter Store or environment variable
+transformation_config = get_trans_config(logger=logger)
 
 # Transfer register configuration (no manifest terminology)
 transfer_register_filename = os.getenv("TRANSFER_REGISTER_FILENAME", "uploaded_records_transfer_register.json")

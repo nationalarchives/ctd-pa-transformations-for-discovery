@@ -25,3 +25,7 @@ notebooks/*
 !notebooks/testing_*.ipynb
 notebooks/testing_marco.ipynb
 ctd-pa-transformations-for-discovery.code-workspace
+
+# AWS deployment scripts (contain sensitive AWS configuration)
+build/publish_lambda.ps1
+build/publish_lambda.sh
