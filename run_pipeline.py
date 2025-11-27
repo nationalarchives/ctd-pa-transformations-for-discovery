@@ -11,6 +11,7 @@ from datetime import datetime
 import time
 import tarfile
 import io
+from collections import defaultdict
 
 repo_root = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(repo_root))
@@ -78,6 +79,8 @@ if run_mode in ["local", "local_s3"]:
 
 # Load transformation configuration from SSM Parameter Store or environment variable
 transformation_config = get_trans_config(logger=logger)
+
+logger.info("Using transformation_config: %s", transformation_config)
 
 # Transfer register configuration (no manifest terminology)
 transfer_register_filename = os.getenv("TRANSFER_REGISTER_FILENAME", "uploaded_records_transfer_register.json")
@@ -176,23 +179,50 @@ def lambda_handler(event, context):
     tmp_path = None
 
     # filter iaid list for replica metadata to those in bucket before applying replica transformer
-    replica_prefix = os.getenv("REPLICA_METADATA_PREFIX", "metadata")
+    replica_metadata_prefix = os.getenv("REPLICA_METADATA_PREFIX", "metadata")
+    replica_filename_prefix = os.getenv("REPLICA_FILENAME_PREFIX", "files")
     
     # Apply test folder prefix to replica metadata if in test mode
-    if test_mode and test_folder:
-        replica_prefix = f"{test_folder}/{replica_prefix}"
-        logger.info("Adjusted replica prefix for test mode: %s", replica_prefix)
+    replica_metadata_prefix = f"{replica_metadata_prefix}"
     
     paginator = s3.get_paginator('list_objects_v2')
     operation_parameters = {'Bucket': bucket,
-                            'Prefix': replica_prefix}
+                            'Prefix': replica_metadata_prefix}
     page_iterator = paginator.paginate(**operation_parameters,
                 PaginationConfig={'MaxItems': 5000})
     
     replica_list = []
     for page in page_iterator:
         replica_list.append(page.get('Contents', []))
-    replica_files = set([Path(obj['Key']).stem for sublist in replica_list for obj in sublist])
+    replica_metadata_filenames = set([Path(obj['Key']).stem for sublist in replica_list for obj in sublist])
+
+    # list filenames in files folder
+    paginator_files = s3.get_paginator('list_objects_v2')
+    operation_parameters_files = {'Bucket': bucket,
+                                  'Prefix': replica_filename_prefix}
+    page_iterator_files = paginator_files.paginate(**operation_parameters_files,
+                PaginationConfig={'MaxItems': 5000})
+    
+    # Build mapping: folder name -> unique list of filenames
+    replica_filedata = defaultdict(list)
+
+    for page in page_iterator_files:
+        for obj in page.get('Contents', []):
+            obj_key = obj['Key']
+            parts = obj_key.split('/')
+            
+            # Only process if it's in the format folder/filename
+            if len(parts) == 3 and parts[1]:  # Avoid empty filenames
+                folder = parts[1]
+                filename = os.path.splitext(parts[2])[0]
+                replica_filedata[folder].append(filename)
+
+
+    # Convert defaultdict to normal dict if needed
+    replica_filedata = dict(replica_filedata)
+    num_files = sum(len(v) for v in replica_filedata.values())
+    logger.debug("replica files: %s", json.dumps(replica_filedata))
+    logger.info("Loaded %s replica data files from S3", num_files)
 
     # Download from S3 in S3 modes (local_s3 or remote_s3)
     if run_mode in ["local_s3", "remote_s3"]:
@@ -310,10 +340,10 @@ def lambda_handler(event, context):
 
         # Collect transformed JSONs by level (in memory)
         jsons_by_level = {}  # {level_name: [(filename, json_dict), ...]}
-
+        replica_filedata_count = 0
         logger.info("Applying transformations to %d JSON files...", len(converted_xml_to_json_files))
         with progress_context(total = len(converted_xml_to_json_files), interval=100, label="Transforming") as tick:
-            for i, (filename, _file) in enumerate(converted_xml_to_json_files.items(), start=1):
+            for i, (filename, _file) in enumerate(converted_xml_to_json_files.items(), start=1): #filename = iaid
                 
                 # Check timeout in remote_s3 mode periodically
                 if run_mode == "remote_s3" and context and i % 100 == 0:
@@ -367,12 +397,24 @@ def lambda_handler(event, context):
                             )
 
                         # now process replica metadata if available
-                        if filename in replica_files:
+                        if filename in replica_metadata_filenames:
                             rtd = ReplicaDataTransformer(bucket_name=bucket,
-                                                            prefix=replica_prefix,
+                                                            prefix=replica_metadata_prefix,
                                                             s3_client=s3 if run_mode in ["local_s3", "remote_s3"] else None)
                             transformed_json = rtd.transform(transformed_json)
                             replica_iaids_added.append(filename)
+
+                            # check that files listed in metadata exist in replica filedata in s3
+                            if transformed_json["record"]["replica"]:
+                                for filedata in transformed_json["record"]["replica"]["files"]:
+                                    #print("filedata:", filedata)
+                                    #print(f"filename: {filedata['name']}, replica_filedata: {replica_filedata.get(filename, [])}")
+                                    if filedata["name"] not in replica_filedata.get(filename, []):
+                                        logger.info("File '%s' listed in replica metadata for IAID '%s' not found in S3 '%s/%s/'", 
+                                                    filedata["name"], filename, replica_filename_prefix, filename)
+                                    else:
+                                        replica_filedata_count += 1
+                                #raise ValueError(f"File '{filedata_name}' listed in replica metadata for IAID '{filename}' not found in S3 '{replica_filename_prefix}/{filename}/'")
                     
                     # Save post-transformation JSON (after all transformers)
                     if save_intermediates and run_mode == "local":
@@ -388,7 +430,7 @@ def lambda_handler(event, context):
                     if use_level_subfolders:
                         level = str(next((v for v in find_key(transformed_json,
                                                               "catalogueLevel")), None))
-                        dir_name = record_level_mapping.get(level, "UNKNOWN")
+                        dir_name = record_level_mapping.get(level, "UNKNOWN").lower().replace(" ", "_")
                         # Collect in memory by level
                         if dir_name not in jsons_by_level:
                             jsons_by_level[dir_name] = []
@@ -421,7 +463,7 @@ def lambda_handler(event, context):
                     is_tna_closed = cl_status == 'D' and closure_type == 'U'
                     # if Open, increment count instead of appending filename
                     if cl_status == 'O':
-                            closure_status_dict['open'] += 1
+                        closure_status_dict['open'] += 1
                     elif is_held_pa:
                         closure_status_dict['held_at_parliament'].append(filename)
                     elif is_tna_closed:
@@ -436,11 +478,16 @@ def lambda_handler(event, context):
     payload = replica_iaids_added
     logger.info("Replica IAIDs added: %s", json.dumps(payload, indent=2))
 
+    payload = replica_filedata_count
+    logger.info("Replica filedata count: %s", json.dumps(payload, indent=2))
+
     # Create in-memory tarballs for each level
     if jsons_by_level and run_mode in ['local_s3', 'remote_s3']:
         with log_timing("Creating tarballs", logger):
             logger.info("Creating %d tarball(s) in memory...", len(jsons_by_level))
-            tree_name = Path(key).stem
+            tree_name = Path(key).stem.lower().replace(" ", "_")
+            print(key)
+            print("tree_name:", tree_name)
             level_tarballs = {}  # {level_name: tar_bytes}
             for level_name, files in jsons_by_level.items():
                 # Define tarball name as <original_filename>_<level_name>.tar.gz
@@ -540,7 +587,7 @@ def lambda_handler(event, context):
         duration = (end_time - start_time).total_seconds()
         h, rem = divmod(duration, 3600)
         m, s = divmod(rem, 60)
-        result = {"status": "ok", "message": f"Processed {key} successfully (Duration: {int(h):02d}:{int(m):02d}:{int(s):02d})"}
+        result = {"status": "ok", "message": f"Processed {len(successfully_transformed_files)} in {key} successfully (Duration: {int(h):02d}:{int(m):02d}:{int(s):02d})"}
         logger.info("Pipeline result: %s", json.dumps(result))
         return result
     else:

@@ -232,7 +232,7 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
                 closureStatus = 'D'
 
             closureCode = record.find("closed_until")
-            if closureStatus == 'D':
+            if closureStatus == 'D': #and closureCode is not None:
                 closureCode = closureCode.text
                 closureCode = datetime.strptime(closureCode, "%Y-%m-%d")
                 closureCode = closureCode.strftime("%Y")
@@ -701,7 +701,6 @@ def convert_to_json(xml_path: str, output_dir: str, remove_empty_fields: bool = 
             print(f"Processed [{i}/{_total_records}]: {(_records_processed/_total_records)*100:.0f}%", end='\r')
             sys.stdout.flush()
 
-    print(f"{len(records)} records processed from the XML file.")
     return records
 
 
