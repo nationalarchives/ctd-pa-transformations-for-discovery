@@ -77,7 +77,7 @@ if run_mode in ["local", "local_s3"]:
     logger.addHandler(file_handler)
 
 
-# Load transformation configuration from SSM Parameter Store or environment variable
+# Load transformation configuration from environment variable or file
 transformation_config = get_trans_config(logger=logger)
 
 logger.info("Using transformation_config: %s", transformation_config)
