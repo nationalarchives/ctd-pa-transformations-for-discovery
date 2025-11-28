@@ -37,3 +37,29 @@ You will need to initialise pre-commit after cloning the newly created repositor
 # Protect Main Branch
 Creating a repo from the template will not set branch protection.
 See [The Engineering Handbook](https://national-archives.atlassian.net/wiki/spaces/DAAE/pages/47775767/Engineering+Handbook) for guidance.
+
+## Testing Mode
+The pipeline supports a simple "testing mode" to run against test folders in S3 (or locally). Enable testing mode by setting environment variables before running the pipeline or deploying the Lambda.
+
+- **`TEST_MODE`**: set to `1`, `true`, `yes` (case-insensitive) to enable test behaviour.
+- **`S3_TEST_FOLDER`**: the prefix/folder in S3 to use for both input and output when testing (do not include a leading or trailing slash).
+
+Examples:
+
+PowerShell (local):
+```powershell
+$env:TEST_MODE = "1"
+$env:S3_TEST_FOLDER = "testing"
+python run_pipeline.py
+```
+
+Bash (local/CI):
+```bash
+export TEST_MODE=1
+export S3_TEST_FOLDER=testing
+python run_pipeline.py
+```
+
+Notes:
+- When `TEST_MODE` is enabled the pipeline will prefix the input `key` and output `S3_OUTPUT_DIR` with the value of `S3_TEST_FOLDER`, making it safe to run without clobbering production outputs.
+- This is intended for development and CI only; ensure you unset these variables or use a different profile when working with real production data.
