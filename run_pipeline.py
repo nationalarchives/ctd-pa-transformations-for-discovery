@@ -489,43 +489,58 @@ def lambda_handler(event, context):
             print(key)
             print("tree_name:", tree_name)
             level_tarballs = {}  # {level_name: tar_bytes}
+            # Batch files per level into tarballs of up to 10,000 JSON files each
+            BATCH_SIZE = 10000
             for level_name, files in jsons_by_level.items():
-                # Define tarball name as <original_filename>_<level_name>.tar.gz
-                tarball_name = f"{tree_name}_{level_name}.tar.gz"
+                # files is a list of (filename, json_data)
+                total_files = len(files)
+                logger.info("Level '%s' has %d files; batching into %d-file chunks", level_name, total_files, BATCH_SIZE)
 
-                # Build tarball in memory
-                buf = io.BytesIO()
-                try:
-                    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-                        for filename, json_data in files:
-                            safe_name = f"{Path(filename).name}.json"
-                            json_bytes = json.dumps(json_data, ensure_ascii=False, 
-                                                    indent=2).encode("utf-8")
-                            ti = tarfile.TarInfo(name=safe_name)
-                            ti.size = len(json_bytes)
-                            ti.mtime = int(time.time())
-                            tar.addfile(ti, fileobj=io.BytesIO(json_bytes))
+                # Create chunks of files
+                chunks = [files[i:i + BATCH_SIZE] for i in range(0, total_files, BATCH_SIZE)]
+                cumulative_count = 0
 
-                    buf.seek(0)
-                    tar_bytes = buf.getvalue()
-                    file_count = len(files)
-                    logger.info("Created in-memory tarball: %s (%d files, %d bytes)",
-                                tarball_name, file_count, len(tar_bytes))
+                for chunk_index, chunk in enumerate(chunks, start=1):
+                    cumulative_count += len(chunk)
+                    # Name tarball with cumulative end count: <tree>_<level>_N.tar.gz where N is cumulative_count
+                    tarball_name = f"{tree_name}_{level_name}_{cumulative_count}.tar.gz"
 
-                    level_tarballs[level_name] = tar_bytes
+                    buf = io.BytesIO()
+                    try:
+                        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                            for filename, json_data in chunk:
+                                safe_name = f"{Path(filename).name}.json"
+                                json_bytes = json.dumps(json_data, ensure_ascii=False,
+                                                        indent=2).encode("utf-8")
+                                ti = tarfile.TarInfo(name=safe_name)
+                                ti.size = len(json_bytes)
+                                ti.mtime = int(time.time())
+                                tar.addfile(ti, fileobj=io.BytesIO(json_bytes))
 
-                    # Write tar by folder in local mode
-                    if run_mode == "local":
-                        tarball_path = output_dir / tarball_name
-                        with tarball_path.open("wb") as f:
-                            f.write(tar_bytes)
-                        logger.info("Saved tarball locally: %s", tarball_path)
+                        buf.seek(0)
+                        tar_bytes = buf.getvalue()
+                        file_count = len(chunk)
+                        logger.info("Created in-memory tarball: %s (%d files, %d bytes)",
+                                    tarball_name, file_count, len(tar_bytes))
 
-                except Exception:
-                    logger.exception("Error creating tarball for level %s", level_name)
-                    result = {"status": "error", "message": f"Error creating tarball for level {level_name}"}
-                    logger.info("Pipeline result: %s", json.dumps(result))
-                    return result
+                        # Store tar bytes under a compound key so super-tar builder can include them
+                        # Use a level-specific list to preserve ordering
+                        if level_name not in level_tarballs:
+                            level_tarballs[level_name] = []
+                        level_tarballs[level_name].append((tarball_name, tar_bytes))
+
+                        # Write tar by folder in local mode
+                        if run_mode == "local":
+                            tarball_path = Path(output_dir) / tarball_name
+                            with tarball_path.open("wb") as f:
+                                f.write(tar_bytes)
+                            logger.info("Saved tarball locally: %s", tarball_path)
+
+                    except Exception:
+                        logger.exception("Error creating tarball for level %s (chunk %d)", level_name, chunk_index)
+                        result = {"status": "error", "message": f"Error creating tarball for level {level_name} chunk {chunk_index}"}
+                        logger.info("Pipeline result: %s", json.dumps(result))
+                        return result
 
             # Upload to S3 in S3 modes (local_s3 or remote_s3)
             # we need to create a super-tarball containing all level tarballs
@@ -542,14 +557,14 @@ def lambda_handler(event, context):
                 # Create super-tarball containing all level tarballs
                 super_buf = io.BytesIO()
                 with tarfile.open(fileobj=super_buf, mode="w:gz") as super_tar:
-                    for level_name, tar_bytes in level_tarballs.items():
-                        level_tarball_name = f"{tree_name}_{level_name}.tar.gz"
-                        ti = tarfile.TarInfo(name=level_tarball_name)
-                        ti.size = len(tar_bytes)
-                        ti.mtime = int(time.time())
-                        super_tar.addfile(ti, fileobj=io.BytesIO(tar_bytes))
-                        logger.info("Added %s to super-tarball (%d bytes)",
-                                    level_tarball_name, len(tar_bytes))
+                    # level_tarballs now maps level_name -> list of (tar_name, tar_bytes)
+                    for level_name, tar_entries in level_tarballs.items():
+                        for tar_name, tar_bytes in tar_entries:
+                            ti = tarfile.TarInfo(name=tar_name)
+                            ti.size = len(tar_bytes)
+                            ti.mtime = int(time.time())
+                            super_tar.addfile(ti, fileobj=io.BytesIO(tar_bytes))
+                            logger.info("Added %s to super-tarball (%d bytes)", tar_name, len(tar_bytes))
 
                 super_buf.seek(0)
                 super_tar_bytes = super_buf.getvalue()
@@ -568,14 +583,12 @@ def lambda_handler(event, context):
                     
                     # Extract and upload each subtar (level tarball) into the same folder
                     super_buf.seek(0)
-                    with tarfile.open(fileobj=super_buf, mode="r:gz") as super_tar:
-                        for member in super_tar.getmembers():
-                            if member.isfile() and member.name.endswith('.tar.gz'):
-                                # Extract the subtar bytes
-                                subtar_bytes = super_tar.extractfile(member).read()
-                                subtar_key = f"{folder_key}{member.name}"
-                                s3.put_object(Bucket=bucket, Key=subtar_key, Body=subtar_bytes)
-                                logger.info("Uploaded subtar to s3://%s/%s", bucket, subtar_key)
+                    # Upload each contained tar (we have them in level_tarballs already)
+                    for level_name, tar_entries in level_tarballs.items():
+                        for tar_name, tar_bytes in tar_entries:
+                            subtar_key = f"{folder_key}{tar_name}"
+                            s3.put_object(Bucket=bucket, Key=subtar_key, Body=tar_bytes)
+                            logger.info("Uploaded subtar to s3://%s/%s", bucket, subtar_key)
                     
                     # Update transfer register with newly uploaded records
                     if transfer_register is not None:
