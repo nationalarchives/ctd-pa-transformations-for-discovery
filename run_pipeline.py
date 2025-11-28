@@ -556,11 +556,26 @@ def lambda_handler(event, context):
                 logger.info("Created super-tarball: %s (%d bytes)",
                             super_tarball_name, len(super_tar_bytes))
 
-                # Upload to json_outputs folder in S3
-                tar_key = f"{output_prefix}/{super_tarball_name}"
+                # Upload to json_outputs folder in S3, creating a subfolder for the supertar
+                folder_name = tree_name  # Use tree_name as the folder name
+                folder_key = f"{output_prefix}/{folder_name}/"
+                
+                # Upload the supertar into the folder
+                tar_key = f"{folder_key}{super_tarball_name}"
                 try:
                     s3.put_object(Bucket=bucket, Key=tar_key, Body=super_tar_bytes)
-                    logger.info("Uploaded tarball to s3://%s/%s", bucket, tar_key)
+                    logger.info("Uploaded supertar to s3://%s/%s", bucket, tar_key)
+                    
+                    # Extract and upload each subtar (level tarball) into the same folder
+                    super_buf.seek(0)
+                    with tarfile.open(fileobj=super_buf, mode="r:gz") as super_tar:
+                        for member in super_tar.getmembers():
+                            if member.isfile() and member.name.endswith('.tar.gz'):
+                                # Extract the subtar bytes
+                                subtar_bytes = super_tar.extractfile(member).read()
+                                subtar_key = f"{folder_key}{member.name}"
+                                s3.put_object(Bucket=bucket, Key=subtar_key, Body=subtar_bytes)
+                                logger.info("Uploaded subtar to s3://%s/%s", bucket, subtar_key)
                     
                     # Update transfer register with newly uploaded records
                     if transfer_register is not None:
@@ -573,10 +588,10 @@ def lambda_handler(event, context):
                             logger.exception("Error saving transfer register (non-fatal)")
                             
                 except ClientError as e:
-                    logger.exception("Error uploading tarball to S3: %s",
+                    logger.exception("Error uploading tarballs to S3: %s",
                                     e.response.get('Error', {}).get('Code'))
                     result = {"status": "error",
-                            "message": f"Error uploading super-tarball to S3: {e.response.get('Error', {}).get('Code')}"}
+                            "message": f"Error uploading tarballs to S3: {e.response.get('Error', {}).get('Code')}"}
                     logger.info("Pipeline result: %s", json.dumps(result))
                     return result
 
