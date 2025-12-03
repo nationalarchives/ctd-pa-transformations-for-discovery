@@ -184,6 +184,49 @@ def lambda_handler(event, context):
     
     # Apply test folder prefix to replica metadata if in test mode
     replica_metadata_prefix = f"{replica_metadata_prefix}"
+
+    # Load definitive department codes from S3 (or local file) once per pipeline run
+    pipeline_valid_refs = None
+    try:
+        valid_key = os.getenv('VALID_DEPT_CODES_KEY', 'references/valid_dept_codes.json').strip()
+        # make sure key points under references/
+        if not valid_key.startswith('references/'):
+            s3_refs_key = f'references/{valid_key}'
+        else:
+            s3_refs_key = valid_key
+
+        # prefer explicit bucket env for refs, otherwise fall back to event bucket
+        refs_bucket = os.getenv('VALID_DEPT_CODES_BUCKET') or os.getenv('INGEST_BUCKET') or os.getenv('S3_BUCKET') or bucket
+        if run_mode in ['local_s3', 'remote_s3'] and s3 is not None and refs_bucket:
+            try:
+                logger.info("Loading definitive refs from s3://%s/%s", refs_bucket, s3_refs_key)
+                resp = s3.get_object(Bucket=refs_bucket, Key=s3_refs_key)
+                raw = resp.get('Body').read()
+                pipeline_valid_refs = json.loads(raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else raw)
+                logger.info("Loaded definitive refs object of type %s", type(pipeline_valid_refs))
+            except ClientError as ce:
+                logger.warning("Could not load definitive refs from S3 (%s/%s): %s", refs_bucket, s3_refs_key, ce)
+            except Exception:
+                logger.exception("Unexpected error loading definitive refs from S3; continuing without definitive refs")
+            
+        if pipeline_valid_refs is None:
+            print(f"valid dept codes list is None")
+            raise ImportError
+
+        else:
+            # Try local file path under repo data/references
+            local_refs = repo_root / 'data' / 'references' / Path(s3_refs_key).name
+            if local_refs.exists():
+                try:
+                    with local_refs.open('r', encoding='utf-8') as fh:
+                        pipeline_valid_refs = json.load(fh)
+                    logger.info("Loaded definitive refs from local file: %s", local_refs)
+                except Exception:
+                    logger.exception("Failed to load definitive refs from local file; continuing without definitive refs")
+            else:
+                logger.debug("No definitive refs file found locally at %s", local_refs)
+    except Exception:
+        logger.exception("Failed to determine/load definitive refs; proceeding without them")
     
     paginator = s3.get_paginator('list_objects_v2')
     operation_parameters = {'Bucket': bucket,
@@ -375,6 +418,11 @@ def lambda_handler(event, context):
                             json.dump(_file, fh, ensure_ascii=False, indent=2)
                         logger.debug("Saved pre-transformed JSON: %s", pre_transform_file)
 
+                    # debugging - filter by json pre and post transformation and print to console
+                    if filename == filter_iaid:
+                        import copy
+                        data_before = copy.deepcopy(_file)
+
                     # newline to <p> transformation
                     transformed_json = None
                     task = transformation_config['tasks'].get('newline_to_p', {})
@@ -385,7 +433,37 @@ def lambda_handler(event, context):
                     # Y naming transformation
                     task = transformation_config['tasks'].get('y_naming')
                     yt = YNamingTransformer(target_columns=task.get('target_columns'))
+                    # set definitive refs on the transformer instance if we loaded them above
+                    try:
+                        if pipeline_valid_refs:
+                            yt.set_definitive_refs(pipeline_valid_refs)
+                            logger.debug("Set definitive refs on YNamingTransformer (count=%s)", None if yt._refs is None else len(yt._refs))
+                    except Exception:
+                        logger.exception("Failed to set definitive refs on YNamingTransformer instance")
                     transformed_json = yt.transform(transformed_json)
+
+                    # filter on record and print to console to see before and after effect of transformations
+                    # set to none in .env (or current config file) to turn off
+                    if filter_iaid is not None and filename == filter_iaid:
+                        before_desc = data_before.get('record', {}).get('scopeContent', {}).get('description')
+                        after_desc = transformed_json.get('record', {}).get('scopeContent', {}).get('description')
+
+                        import pprint as pp
+                        print()
+                        print(f"Showing before and after transformation for {filename}:")
+                        print("="*80)
+                        print("data before transformation")
+                        print("-"*80)
+                        pp.pprint(before_desc)
+                        print("="*80)
+                        print()
+                        print()
+                        print("="*80)
+                        print("data after transformation")
+                        print("-"*80)
+                        pp.pprint(after_desc)
+                        print("="*80)
+                        print()
 
                     # Replica data transformation
                     do_replicas = True
@@ -405,8 +483,8 @@ def lambda_handler(event, context):
                             replica_iaids_added.append(filename)
 
                             # check that files listed in metadata exist in replica filedata in s3
-                            if transformed_json["record"]["replica"]:
-                                for filedata in transformed_json["record"]["replica"]["files"]:
+                            if transformed_json["replica"]:
+                                for filedata in transformed_json["replica"]["files"]:
                                     #print("filedata:", filedata)
                                     #print(f"filename: {filedata['name']}, replica_filedata: {replica_filedata.get(filename, [])}")
                                     if filedata["name"] not in replica_filedata.get(filename, []):

@@ -6,6 +6,7 @@ ctd_pa_lambda_discovery/
 python/
 test_venv/
 build/
+tools/
 
 # Configuration files
 *.yaml
@@ -22,9 +23,7 @@ xml_input/
 json_outputs/
 
 # specific notebooks
-notebooks/*
-!notebooks/testing_*.ipynb
-notebooks/testing_marco.ipynb
+notebooks/
 
 # vscode related
 ctd-pa-transformations-for-discovery.code-workspace

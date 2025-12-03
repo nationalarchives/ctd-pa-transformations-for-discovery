@@ -984,14 +984,67 @@ class YNamingTransformer():
 
     def __init__(self,
                  target_columns: Optional[List[str]] = None,
-                 backup_original: bool = True):
+                 backup_original: bool = True,
+                 ref_set: Optional[set] = None):
         """Initialize the transformer."""
         self.logger = logging.getLogger("pipeline.transformers.y_naming")
         # Default columns to process
         self.target_columns = target_columns
         self.backup_original = backup_original
-        # Loaded definitive reference set (optional)
+        # Loaded definitive reference set (optional) - normalize if provided
         self._refs = None
+        if ref_set is not None:
+            try:
+                self.set_definitive_refs(ref_set)
+            except Exception:
+                self.logger.debug("Failed to normalize ref_set in constructor", exc_info=True)
+
+    def set_definitive_refs(self, refs: Optional[Iterable[str]]):
+        """Set/normalize the definitive reference set used for membership checks.
+
+        Accepts an iterable of strings (or None). Normalises to upper-case stripped strings.
+        Returns self to allow fluent usage.
+        """
+        if refs is None:
+            self._refs = None
+            return self
+        try:
+            # If caller passed a JSON string, try to parse it.
+            if isinstance(refs, str):
+                try:
+                    import json as _json
+                    parsed = _json.loads(refs)
+                    return self.set_definitive_refs(parsed)
+                except Exception:
+                    # not JSON; treat as single code string
+                    refs = [refs]
+
+            # If a dict was provided, try common shapes.
+            if isinstance(refs, dict):
+                # Prefer explicit list under known key
+                for key in ('valid_department_codes', 'valid_dept_codes', 'valid_refs'):
+                    if key in refs:
+                        refs = refs[key]
+                        break
+                else:
+                    # If dict appears to be mapping code->bool, use keys
+                    if all(isinstance(k, str) for k in refs.keys()):
+                        refs = list(refs.keys())
+                    else:
+                        # Fall back to using any string values
+                        vals = [v for v in refs.values() if isinstance(v, str)]
+                        refs = vals
+
+            # Finally, normalise iterable of strings into a set
+            self._refs = {r.strip().upper() for r in refs if isinstance(r, str) and r.strip()}
+            try:
+                self.logger.debug("set_definitive_refs normalized refs count: %s", None if self._refs is None else len(self._refs))
+            except Exception:
+                pass
+        except Exception:
+            self.logger.exception("Invalid refs provided to set_definitive_refs; ignoring")
+            self._refs = None
+        return self
 
     def transform(self, data, json_id=None, **kwargs):
         # Delegate to transform_json; apply to all if target_columns is None
@@ -1013,13 +1066,12 @@ class YNamingTransformer():
             # if definitive set not loaded, we conservatively treat syntactic matches as references
             # (caller should load the set for stricter behavior)
             if self._refs is None:
-                result = self._apply_y_naming(text)
-                return result
-            # exact membership check
-            if text in self._refs:
-                result = self._apply_y_naming(text)
-                return result
-            return text
+                return self._apply_y_naming(text)
+            # normalized membership check (strip + upper) via helper
+            normalized_whole = text.strip().upper()
+            if self._membership_ok(normalized_whole):
+                return self._apply_y_naming(text)
+            # not a member of definitive set; fall through to embedded replacement
 
         # Otherwise, attempt to find embedded reference-like tokens anywhere in the text
         try:
@@ -1053,15 +1105,29 @@ class YNamingTransformer():
                 return token
             # membership check if definitive set loaded
             if self._refs is not None:
-                if token in self._refs:
+                if self._membership_ok(token):
                     return self._apply_y_naming(token)
-                else:
-                    return token
+                return token
             # no definitive set loaded: apply algorithmic transform
             return self._apply_y_naming(token)
 
         # Use sub with function to handle multiple occurrences and preserve other text
-        return self._embedded_token_re.sub(repl, text)
+        out = self._embedded_token_re.sub(repl, text)
+
+        # If we have definitive refs, also replace short bare tokens inside text
+        # (e.g. "... BBK ...") but only when the token is in the definitive set.
+        if self._refs:
+            short_re = re.compile(r'\b([A-Z]{1,4})\b')
+
+            def repl_short(m: re.Match) -> str:
+                tok = m.group(1)
+                if self._membership_ok(tok) and self._is_reference_like(tok):
+                    return self._apply_y_naming(tok)
+                return tok
+
+            out = short_re.sub(repl_short, out)
+
+        return out
 
     # ----- JSON-dict transform API for pipeline runtime -----
     def transform_json(self, data: dict, target_columns: Optional[List[str]] = None, json_id: Optional[int] = None) -> dict:
@@ -1246,6 +1312,28 @@ class YNamingTransformer():
         result = new_prefix + suffix
         return result
 
+    def _membership_ok(self, token: str) -> bool:
+        """Central membership helper.
+
+        - Normalizes token by stripping and uppercasing.
+        - Returns True if token is present in the definitive refs set (`self._refs`).
+        - Special-case: accept 'PARL' as a member (caller expects PARL -> YUKP transformation)
+          even if the canonical set does not contain 'PARL'. This does NOT map PARL to PAR;
+          it simply allows PARL to be treated as an accepted token so `_apply_y_naming`
+          can transform it to 'YUKP'.
+        """
+        if not isinstance(token, str):
+            return False
+        t = token.strip().upper()
+        if not t:
+            return False
+        # Special-case accept PARL (user requirement: transform PARL -> YUKP)
+        if t == 'PARL':
+            return True
+        if self._refs is None:
+            return False
+        return t in self._refs
+
     def _transform_all_strings_json(self, obj, json_id):
         """Recursively apply Y-naming to all string values in the JSON object."""
         def _recurse_and_transform(current_obj, path=""):
@@ -1272,22 +1360,43 @@ class YNamingTransformer():
         _recurse_and_transform(obj)
 
     def _is_reference_like(self, s: str) -> bool:
-        """Quick syntactic check: at least one slash, at most 9 slashes, tokens uppercase alnum/hyphen.
-
-        Accept a trailing slash (e.g. 'ABC/') by allowing an empty final token, but reject empty
-        tokens elsewhere (so 'ABC//DEF' and '///' are rejected).
+        """Returns True if the string `s` is syntactically similar to a citable reference.
         """
+
         if not isinstance(s, str):
             return False
         orig = s
-        s = s.strip()
-        if len(s) < 2 or len(s) > 250:
+        t = s.strip()
+        if not t:
+            return False
+        
+        # allow special-case tokens like PARL to be accepted via membership helper
+
+        # Reject if more than 9 slashes (invalid reference)
+        if t.count('/') > 9:
+            return False
+        
+        if re.fullmatch(r'[A-Z]{1,4}', t):
+            # If definitive refs loaded, require membership of the bare token via helper.
+            if self._refs is not None:
+                return self._membership_ok(t)
+            # If no definitive refs, do not accept bare tokens by default.
             return False
 
         # explicit exclusion: any token starting with "APT/" should be rejected (case-insensitive)
         # We use a word boundary before APT to avoid matching inside longer tokens like CAPT/.
         if re.search(r'(?i)\bAPT/', orig):
             return False
+        
+        # Embedded short token inside other text (e.g. "(see FLS)")
+        m = re.search(r'\b([A-Z]{1,4})\b', t)
+        if m and (m.group(1) != t):
+            # Accept embedded uppercase tokens; if definitive refs loaded,
+            # require membership via helper.
+            token = m.group(1).upper()
+            if self._refs is not None:
+                return self._membership_ok(token)
+            return True
 
         # check that the token contains 1 to 9 slashes
         slash_count = s.count('/')
@@ -1406,7 +1515,7 @@ class ReplicaDataTransformer:
         meta = self._fetch_metadata(iaid)
         if meta:
             out = copy.deepcopy(json_record)
-            out['record']['replica'] = meta
+            out['replica'] = meta
             out['record']['replicaId'] = meta.get('replicaId')
             return out
         return json_record
