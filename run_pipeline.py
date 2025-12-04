@@ -228,6 +228,43 @@ def lambda_handler(event, context):
     except Exception:
         logger.exception("Failed to determine/load definitive refs; proceeding without them")
     
+    # Load Y-naming exclusions from S3 (or local file) once per pipeline run
+    pipeline_ynaming_exclusions = None
+    try:
+        exclusions_key = os.getenv('YNAMING_EXCLUSIONS_KEY', 'references/ynaming_exclusions.json').strip()
+        if not exclusions_key.startswith('references/'):
+            exclusions_key = f'references/{exclusions_key}'
+        
+        # Try S3 first (use same bucket as refs)
+        if run_mode in ['local_s3', 'remote_s3'] and s3 is not None and refs_bucket:
+            try:
+                logger.info("Loading Y-naming exclusions from s3://%s/%s", refs_bucket, exclusions_key)
+                resp = s3.get_object(Bucket=refs_bucket, Key=exclusions_key)
+                raw = resp.get('Body').read()
+                pipeline_ynaming_exclusions = json.loads(raw.decode('utf-8') if isinstance(raw, (bytes, bytearray)) else raw)
+                logger.info("Loaded Y-naming exclusions (type=%s, count=%s)", type(pipeline_ynaming_exclusions), 
+                           len(pipeline_ynaming_exclusions) if isinstance(pipeline_ynaming_exclusions, (list, dict)) else 'N/A')
+            except ClientError as ce:
+                if ce.response.get('Error', {}).get('Code') not in ('404', 'NoSuchKey'):
+                    logger.warning("Could not load Y-naming exclusions from S3 (%s/%s): %s", refs_bucket, exclusions_key, ce)
+            except Exception:
+                logger.exception("Unexpected error loading Y-naming exclusions from S3; continuing without exclusions")
+        
+        # Try local fallback if S3 didn't work
+        if pipeline_ynaming_exclusions is None:
+            local_exclusions = repo_root / 'data' / 'references' / Path(exclusions_key).name
+            if local_exclusions.exists():
+                try:
+                    with local_exclusions.open('r', encoding='utf-8') as fh:
+                        pipeline_ynaming_exclusions = json.load(fh)
+                    logger.info("Loaded Y-naming exclusions from local file: %s", local_exclusions)
+                except Exception:
+                    logger.exception("Failed to load Y-naming exclusions from local file; continuing without exclusions")
+            else:
+                logger.debug("No Y-naming exclusions file found locally at %s", local_exclusions)
+    except Exception:
+        logger.exception("Failed to determine/load Y-naming exclusions; proceeding without them")
+    
     paginator = s3.get_paginator('list_objects_v2')
     operation_parameters = {'Bucket': bucket,
                             'Prefix': replica_metadata_prefix}
@@ -465,13 +502,24 @@ def lambda_handler(event, context):
                             logger.debug("Set definitive refs on YNamingTransformer (count=%s)", None if yt._refs is None else len(yt._refs))
                     except Exception:
                         logger.exception("Failed to set definitive refs on YNamingTransformer instance")
+                    # set Y-naming exclusions if loaded
+                    try:
+                        if pipeline_ynaming_exclusions:
+                            # Handle both list and dict shapes (dict may have 'exclusions' key)
+                            exclusions_list = pipeline_ynaming_exclusions
+                            if isinstance(pipeline_ynaming_exclusions, dict):
+                                exclusions_list = pipeline_ynaming_exclusions.get('exclusions', pipeline_ynaming_exclusions.get('patterns', []))
+                            yt.set_ynaming_exclusions(exclusions_list)
+                            logger.debug("Set Y-naming exclusions on transformer (count=%s)", len(yt._exclusion_patterns))
+                    except Exception:
+                        logger.exception("Failed to set Y-naming exclusions on YNamingTransformer instance")
                     transformed_json = yt.transform(transformed_json)
 
                     # filter on record and print to console to see before and after effect of transformations
                     # set to none in .env (or current config file) to turn off
                     if filter_iaid is not None and filename == filter_iaid:
-                        before_desc = data_before.get('record', {}).get('scopeContent', {}).get('description')
-                        after_desc = transformed_json.get('record', {}).get('scopeContent', {}).get('description')
+                        before_desc = data_before.get('record', {}).get('relatedMaterial', {})[0].get('description')
+                        after_desc = transformed_json.get('record', {}).get('relatedMaterial', {})[0].get('description')
 
                         import pprint as pp
                         print()

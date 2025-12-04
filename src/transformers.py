@@ -997,6 +997,8 @@ class YNamingTransformer():
         self.backup_original = backup_original
         # Loaded definitive reference set (optional) - normalize if provided
         self._refs = None
+        # Exclusion patterns (compiled regexes) to skip Y-naming for specific contextual phrases
+        self._exclusion_patterns = []
         if ref_set is not None:
             try:
                 self.set_definitive_refs(ref_set)
@@ -1050,6 +1052,59 @@ class YNamingTransformer():
             self._refs = None
         return self
 
+    def set_ynaming_exclusions(self, exclusions: Optional[Iterable[str]]):
+        """Set exclusion patterns from a list of contextual phrases or regex strings.
+        
+        Each exclusion is compiled into a case-insensitive regex. If the input text matches
+        any exclusion pattern, Y-naming will be skipped for that text.
+        
+        Args:
+            exclusions: List of strings (literal phrases or regex patterns) to exclude.
+                       Literal phrases (no regex metacharacters) are escaped and compiled.
+                       Patterns with metacharacters are compiled as-is.
+        
+        Returns:
+            self for fluent chaining
+        """
+        self._exclusion_patterns = []
+        if not exclusions:
+            return self
+        
+        for ex in exclusions:
+            if not ex or not isinstance(ex, str):
+                continue
+            try:
+                # Check if string contains regex metacharacters
+                if re.search(r'[][().*+?^$\\|{}]', ex):
+                    # Treat as regex pattern (user may have supplied literal parens/dots for context)
+                    # Escape it to be safe, then compile
+                    self._exclusion_patterns.append(re.compile(re.escape(ex), flags=re.IGNORECASE))
+                else:
+                    # Plain literal string without special chars
+                    self._exclusion_patterns.append(re.compile(re.escape(ex), flags=re.IGNORECASE))
+            except Exception as e:
+                self.logger.warning("Failed to compile exclusion pattern '%s': %s", ex, e)
+                continue
+        
+        self.logger.debug("Loaded %d exclusion patterns", len(self._exclusion_patterns))
+        return self
+
+    def _is_excluded_by_pattern(self, text: str) -> bool:
+        """Check if text matches any exclusion pattern.
+        
+        Args:
+            text: The full text to check
+        
+        Returns:
+            True if text matches any exclusion pattern, False otherwise
+        """
+        if not text or not self._exclusion_patterns:
+            return False
+        for pattern in self._exclusion_patterns:
+            if pattern.search(text):
+                return True
+        return False
+
     def transform(self, data, json_id=None, **kwargs):
         # Delegate to transform_json; apply to all if target_columns is None
         return self.transform_json(data, target_columns=self.target_columns, json_id=json_id)
@@ -1061,12 +1116,31 @@ class YNamingTransformer():
         """
         If `text` is syntactically reference-like and present in the loaded definitive set,
         apply Y naming and return the transformed value. Otherwise return original text.
+        
+        Uses position-aware exclusion checking: only skips Y-prefix for tokens that fall
+        within excluded contextual phrases (e.g., "(their ref: DL.MEL)").
         """
 
         if not isinstance(text, str):
             return text
+        
+        # Build list of exclusion spans (start, end positions) in the original text
+        exclusion_spans = []
+        if self._exclusion_patterns:
+            for pattern in self._exclusion_patterns:
+                try:
+                    for match in pattern.finditer(text):
+                        exclusion_spans.append((match.start(), match.end()))
+                except Exception:
+                    continue
+        
         # If the whole field is a canonical reference-like string, handle as before
+        # but check if the entire string is within an exclusion span
         if self._is_reference_like(text):
+            # Check if entire text is excluded
+            if exclusion_spans and any(start == 0 and end >= len(text) for start, end in exclusion_spans):
+                return text
+            
             # if definitive set not loaded, we conservatively treat syntactic matches as references
             # (caller should load the set for stricter behavior)
             if self._refs is None:
@@ -1078,8 +1152,9 @@ class YNamingTransformer():
             # not a member of definitive set; fall through to embedded replacement
 
         # Otherwise, attempt to find embedded reference-like tokens anywhere in the text
+        # Pass exclusion spans so token-level checking can skip excluded positions
         try:
-            new_text = self._replace_embedded_references(text)
+            new_text = self._replace_embedded_references(text, exclusion_spans)
             if new_text != text:
                 self.logger.debug(f"Applied Y naming to embedded references in: '{text}' -> '{new_text}'")
             return new_text
@@ -1089,7 +1164,7 @@ class YNamingTransformer():
             return text
 
 
-    def _replace_embedded_references(self, text: str) -> str:
+    def _replace_embedded_references(self, text: str, exclusion_spans: list = None) -> str:
         """Find embedded reference-like tokens in `text` and replace each with its Y-named equivalent.
 
         Behavior:
@@ -1097,13 +1172,33 @@ class YNamingTransformer():
         - For each token: if `is_reference_like(token)` and either no `_refs` loaded or the token (normalized) is in `_refs`,
           replace the token with `_apply_y_naming(token)`; otherwise leave it unchanged.
         - Preserves surrounding text and punctuation.
+        - Skips tokens that fall within exclusion_spans (position-based exclusion).
+        
+        Args:
+            text: The text to process
+            exclusion_spans: List of (start, end) tuples indicating positions to exclude from transformation
         """
 
         if not isinstance(text, str):
             return text
+        
+        if exclusion_spans is None:
+            exclusion_spans = []
+        
+        # Helper: check if a match position overlaps any exclusion span
+        def is_position_excluded(match_start: int, match_end: int) -> bool:
+            for ex_start, ex_end in exclusion_spans:
+                # Check if match overlaps with exclusion span
+                if not (match_end <= ex_start or match_start >= ex_end):
+                    return True
+            return False
 
         def repl(m: re.Match) -> str:
             token = m.group(1)
+            # Check if this token's position is within an excluded span
+            if is_position_excluded(m.start(), m.end()):
+                return token
+            
             # quick syntactic check on the token itself
             if not self._is_reference_like(token):
                 return token
@@ -1125,6 +1220,10 @@ class YNamingTransformer():
 
             def repl_short(m: re.Match) -> str:
                 tok = m.group(1)
+                # Check if this token's position is within an excluded span
+                if is_position_excluded(m.start(), m.end()):
+                    return tok
+                
                 if self._membership_ok(tok) and self._is_reference_like(tok):
                     return self._apply_y_naming(tok)
                 return tok
