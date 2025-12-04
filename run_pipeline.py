@@ -387,9 +387,31 @@ def lambda_handler(event, context):
         jsons_by_level_normal = {}  # {level_name: [(filename, json_dict), ...]}
         jsons_by_level_digitised = {}
         replica_filedata_count = 0
+        bfi_exclusion_list = []
+        bfi_exclusion_code = os.getenv("BFI_EXCLUSION_CODE", None).strip()
         logger.info("Applying transformations to %d JSON files...", len(converted_xml_to_json_files))
         with progress_context(total = len(converted_xml_to_json_files), interval=100, label="Transforming") as tick:
             for i, (filename, _file) in enumerate(converted_xml_to_json_files.items(), start=1): #filename = iaid
+
+                # exclude BFI records if configured
+                if bfi_exclusion_code is not None and bfi_exclusion_code == "2870":
+                    if _file.get('record', {}).get('heldBy', [])[0].get('xReferenceCode') == bfi_exclusion_code:
+                        bfi_exclusion_list.append(filename)
+                        
+                        # Save excluded BFI JSON to intermediate folder
+                        if run_mode in ["local","local_s3"]:
+                            temp_dir_level = str(_file.get("record", {}).get("catalogueLevel", "unknown")).lower().replace(" ", "_")
+                            bfi_exclusion_dir = intermediate_dir / "bfi_exclusion_json_files" / temp_dir_level
+                            bfi_exclusion_dir.mkdir(parents=True, exist_ok=True)
+                            bfi_exclusion_file = bfi_exclusion_dir / f"{filename}.json"
+                            try:
+                                with bfi_exclusion_file.open("w", encoding="utf-8") as fh:
+                                    json.dump(_file, fh, ensure_ascii=False, indent=2)
+                                logger.debug("Saved BFI excluded JSON: %s", bfi_exclusion_file)
+                            except Exception as exc:
+                                logger.warning("Failed to save BFI excluded JSON %s: %s", filename, exc)
+                        
+                        continue
                 
                 # Check timeout in remote_s3 mode periodically
                 if run_mode == "remote_s3" and context and i % 100 == 0:
@@ -575,6 +597,9 @@ def lambda_handler(event, context):
 
     payload = replica_filedata_count
     logger.info("Replica filedata count: %s", json.dumps(payload, indent=2))
+
+    payload = bfi_exclusion_list
+    logger.info("BFI Exclusion List: %s", json.dumps(payload, indent=2))
 
     # Create in-memory tarballs for each level (normal and digitised) and upload
     if (jsons_by_level_normal or jsons_by_level_digitised) and run_mode in ['local_s3', 'remote_s3']:
