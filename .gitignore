@@ -8,6 +8,7 @@ python/
 test_venv/
 build/
 tools/
+/logs/
 
 # Configuration files
 *.yaml
@@ -16,8 +17,8 @@ trigger.json
 *.env
 *.pyc
 *.zip
+.env copy
 
-/logs/
 
 # temp buckets
 xml_input/
